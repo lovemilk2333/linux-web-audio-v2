@@ -33,7 +33,9 @@ async function start() {
     });
     pcmWorkletNode.connect(audioContext.destination);
 
-    const wsUrl = new URL('/backend/stream', location.href);
+    // for < Chrome 125, we are not using relative URL
+    // https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/WebSocket#browser_compatibility
+    const wsUrl = new URL('/backend/v2/stream', location.href);
     wsUrl.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     
     ws = new WebSocket(wsUrl);

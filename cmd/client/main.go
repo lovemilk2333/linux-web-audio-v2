@@ -57,7 +57,7 @@ func (as *AudioStream) Read(p []byte) (n int, err error) {
 }
 
 var args struct {
-	URL string `arg:"-u,--url" help:"listen at" default:"ws://127.0.0.1:8643/backend/stream"`
+	URL string `arg:"-u,--url" help:"listen at" default:"ws://127.0.0.1:8643/backend/v2/stream"`
 }
 
 func main() {

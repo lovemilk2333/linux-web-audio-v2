@@ -28,13 +28,13 @@ func (this *RingBuffer[S, D]) GetLock() *sync.RWMutex {
 }
 
 func (this *RingBuffer[S, D]) IsEmpty() bool {
-	return this.data_length == 0
-}
-
-func (this *RingBuffer[S, D]) UpdateRange() {
 	this.mu.RLock()
 	defer this.mu.RUnlock()
 
+	return this.data_length == 0
+}
+
+func (this *RingBuffer[S, D]) updateRange() {
 	if this.data_length == 0 {
 		this.min_seq = 0
 		this.max_seq = 0
@@ -44,18 +44,28 @@ func (this *RingBuffer[S, D]) UpdateRange() {
 	}
 }
 
+func (this *RingBuffer[S, D]) UpdateRange() {
+	this.mu.RLock()
+	defer this.mu.RUnlock()
+
+	this.updateRange()
+}
+
 /*
-NOTE: data length cannot be greater than cap
 NOTE: you should use lock manually
+
+@returns last n items appended of data
 */
-func (this *RingBuffer[S, D]) Append(data ...D) {
+func (this *RingBuffer[S, D]) Append(data ...D) int {
 	length := len(data)
 	if length == 0 {
-		return
+		return 0
 	}
 
-	this.mu.Lock()
-	defer this.mu.Unlock()
+	if length > int(this.data_cap) {
+		data = data[length-int(this.data_cap):]
+		length = int(this.data_cap)
+	}
 
 	length_diff := int(this.data_cap) - (int(this.data_length) + length)
 
@@ -66,12 +76,14 @@ func (this *RingBuffer[S, D]) Append(data ...D) {
 	} else {
 		overflow := -length_diff
 		copy(this.data, this.data[overflow:this.data_length])
-		this.data_length -= S(overflow)
-		copy(this.data[this.data_length:], data)
-		this.data_length += S(length)
+		base := int(this.data_length) - overflow
+		copy(this.data[base:], data)
+		this.data_length = this.data_cap
 	}
 
-	this.UpdateRange()
+	this.updateRange()
+
+	return length
 }
 
 func (this *RingBuffer[S, D]) getRange(min_seq S, max_seq S) ([]D, bool) {
@@ -94,7 +106,11 @@ func (this *RingBuffer[S, D]) getRange(min_seq S, max_seq S) ([]D, bool) {
 		return nil, false
 	}
 
-	return this.data[start:end], full_range
+	// copy to avoid data-race
+	result := make([]D, end-start)
+	copy(result, this.data[start:end])
+
+	return result, full_range
 }
 
 func (this *RingBuffer[S, D]) GetRange(min_seq S, max_seq S) ([]D, bool) {
@@ -116,6 +132,28 @@ func (this *RingBuffer[S, D]) GetGreater(min_seq S) ([]D, bool) {
 	defer this.mu.RUnlock()
 
 	return this.getRange(min_seq, this.max_seq)
+}
+
+func (this *RingBuffer[S, D]) First(n S) ([]D, bool) {
+	this.mu.RLock()
+	defer this.mu.RUnlock()
+
+	if this.data_length < n {
+		return this.data[:], false
+	}
+
+	return this.data[:n], true
+}
+
+func (this *RingBuffer[S, D]) Last(n S) ([]D, bool) {
+	this.mu.RLock()
+	defer this.mu.RUnlock()
+
+	if this.data_length < n {
+		return this.data[:], false
+	}
+
+	return this.data[this.data_length-n:], true
 }
 
 func NewRingBuffer[S UnsignedSeq, T Seqable[S]](max_data_length S) *RingBuffer[S, T] {
