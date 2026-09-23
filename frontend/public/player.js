@@ -1,58 +1,114 @@
-// player.js - 无缓冲区、即收即播模式
+const MAX_BUFFERED_SAMPLES = 24000; // 500 ms at 48 kHz
+const PREFILL_SAMPLES = 960;
+const FADE_SAMPLES = 64;
 
 class PCMPlayerProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-
-    // 存放接收到的 raw 交错数据帧队列 [Float32Array, Float32Array, ...]
     this.packetQueue = [];
-    
-    // 当前正在消费的 packet 及其内部读取偏移指针
     this.currentPacket = null;
     this.currentOffset = 0;
+    this.bufferedSamples = 0;
+    this.samplesSinceReport = 0;
+    this.samplesPerPacket = 0;
+    this.lastReceivedSequence = null;
+    this.primed = false;
+    this.fadeIn = 0;
+    this.fadeOut = 0;
+    this.lastLeft = 0;
+    this.lastRight = 0;
+    this.underruns = 0;
+    this.droppedPackets = 0;
 
     this.port.onmessage = (event) => {
-      const { type, interleaved } = event.data;
-      if (type === "PCM_DATA" && interleaved) {
-        // 直接压入队列，给什么写什么
-        this.packetQueue.push(interleaved);
+      const { type, interleaved, sequence } = event.data;
+      if (type === "CLEAR") {
+        this.packetQueue = [];
+        this.currentPacket = null;
+        this.currentOffset = 0;
+        this.bufferedSamples = 0;
+        this.primed = false;
+        this.fadeIn = 0;
+        this.fadeOut = 0;
+        this.lastLeft = 0;
+        this.lastRight = 0;
+        return;
+      }
+      if (type !== "PCM_DATA" || !interleaved || interleaved.length === 0 || interleaved.length % 2 !== 0) return;
+
+      this.packetQueue.push(interleaved);
+      this.lastReceivedSequence = sequence;
+      this.samplesPerPacket = interleaved.length / 2;
+      this.bufferedSamples += this.samplesPerPacket;
+      while (this.bufferedSamples > MAX_BUFFERED_SAMPLES && this.packetQueue.length > 1) {
+        const discarded = this.packetQueue.shift();
+        this.bufferedSamples -= discarded.length / 2;
+        this.droppedPackets++;
       }
     };
   }
 
   process(inputs, outputs) {
     const output = outputs[0];
-    const leftChannel = output[0];  // 声道 0: 左
-    const rightChannel = output[1]; // 声道 1: 右
-
+    const leftChannel = output[0];
+    const rightChannel = output[1];
     if (!leftChannel || !rightChannel) return true;
 
-    const frameSize = leftChannel.length; // 通常为 128 点
-
-    // 逐点填充当前 128 点的输出帧
-    for (let i = 0; i < frameSize; i++) {
-      // 如果当前没有正在读取的 packet，尝试从队列拿下一个
-      while (!this.currentPacket || this.currentOffset >= this.currentPacket.length) {
-        if (this.packetQueue.length === 0) {
-          // 队列空了（无数据），剩余点数补静音 0
-          this.currentPacket = null;
-          this.currentOffset = 0;
-          leftChannel[i] = 0;
-          rightChannel[i] = 0;
-          break;
-        }
-        this.currentPacket = this.packetQueue.shift();
-        this.currentOffset = 0;
+    for (let i = 0; i < leftChannel.length; i++) {
+      if (!this.primed && this.fadeOut === 0 && this.bufferedSamples >= PREFILL_SAMPLES) {
+        this.primed = true;
+        this.fadeIn = FADE_SAMPLES;
       }
 
-      // 如果成功取到数据，提取并解交错 (L/R)
-      if (this.currentPacket) {
-        leftChannel[i] = this.currentPacket[this.currentOffset];
-        rightChannel[i] = this.currentPacket[this.currentOffset + 1];
-        this.currentOffset += 2; // 双声道步进 2
+      if (this.fadeOut > 0) {
+        const scale = (this.fadeOut - 1) / FADE_SAMPLES;
+        leftChannel[i] = this.lastLeft * scale;
+        rightChannel[i] = this.lastRight * scale;
+        this.fadeOut--;
+        continue;
+      }
+
+      if (!this.primed) continue;
+
+      if (!this.currentPacket) {
+        this.currentPacket = this.packetQueue.shift() || null;
+        this.currentOffset = 0;
+      }
+      if (!this.currentPacket) {
+        this.primed = false;
+        this.fadeIn = 0;
+        this.fadeOut = FADE_SAMPLES;
+        this.underruns++;
+        i--;
+        continue;
+      }
+
+      const packet = this.currentPacket;
+      const scale = this.fadeIn > 0 ? (FADE_SAMPLES - this.fadeIn + 1) / FADE_SAMPLES : 1;
+      leftChannel[i] = packet[this.currentOffset] * scale;
+      rightChannel[i] = packet[this.currentOffset + 1] * scale;
+      if (this.fadeIn > 0) this.fadeIn--;
+      this.lastLeft = leftChannel[i];
+      this.lastRight = rightChannel[i];
+      this.currentOffset += 2;
+      this.bufferedSamples--;
+
+      if (this.currentOffset >= packet.length) {
+        this.currentPacket = null;
       }
     }
 
+    this.samplesSinceReport += leftChannel.length;
+    if (this.samplesSinceReport >= 4800) {
+      this.samplesSinceReport = 0;
+      this.port.postMessage({
+        type: "BUFFER_STATUS",
+        bufferedPackets: this.samplesPerPacket ? Math.ceil(this.bufferedSamples / this.samplesPerPacket) : 0,
+        sequence: this.lastReceivedSequence,
+        underruns: this.underruns,
+        droppedPackets: this.droppedPackets,
+      });
+    }
     return true;
   }
 }

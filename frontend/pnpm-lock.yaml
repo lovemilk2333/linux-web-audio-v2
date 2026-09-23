@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      bson:
+        specifier: ^7.3.3
+        version: 7.3.3
       libopus-wasm:
         specifier: ^0.4.0
         version: 0.4.0
@@ -220,6 +223,10 @@ packages:
 
   alien-signals@3.2.1:
     resolution: {integrity: sha512-I8FjmltrfnDFoZedi5CG8DghVYNhzb/Ijluz7tCSJH0xpd0484Kowhbb1XDYOxfJpU1p5wnM2X54dA+IfGyD1g==}
+
+  bson@7.3.3:
+    resolution: {integrity: sha512-oz3LwE3qGEhTCSyhzQRLY3Bj1NLOsjFMf6tcmY5J8M+3R7EVcmoBfSHWvjUK3yXCLDUsGpIuB3aQL4nDZ1EV/g==}
+    engines: {node: '>=20.19.0'}
 
   csstype@3.2.3:
     resolution: {integrity: sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ==}
@@ -591,6 +598,8 @@ snapshots:
       vue: 3.5.43(typescript@6.0.3)
 
   alien-signals@3.2.1: {}
+
+  bson@7.3.3: {}
 
   csstype@3.2.3: {}
 

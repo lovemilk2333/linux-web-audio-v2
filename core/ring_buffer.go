@@ -45,8 +45,8 @@ func (this *RingBuffer[S, D]) updateRange() {
 }
 
 func (this *RingBuffer[S, D]) UpdateRange() {
-	this.mu.RLock()
-	defer this.mu.RUnlock()
+	this.mu.Lock()
+	defer this.mu.Unlock()
 
 	this.updateRange()
 }
@@ -131,7 +131,24 @@ func (this *RingBuffer[S, D]) GetGreater(min_seq S) ([]D, bool) {
 	this.mu.RLock()
 	defer this.mu.RUnlock()
 
-	return this.getRange(min_seq, this.max_seq)
+	if this.data_length == 0 {
+		return nil, true
+	}
+
+	index := S(min_seq - this.min_seq)
+	if index < this.data_length {
+		start := int(index) + 1
+		result := make([]D, int(this.data_length)-start)
+		copy(result, this.data[start:this.data_length])
+		return result, true
+	}
+
+	if S(this.min_seq-min_seq) < ^S(0)/2 {
+		result := make([]D, this.data_length)
+		copy(result, this.data[:this.data_length])
+		return result, false
+	}
+	return nil, true
 }
 
 func (this *RingBuffer[S, D]) First(n S) ([]D, bool) {
@@ -139,10 +156,14 @@ func (this *RingBuffer[S, D]) First(n S) ([]D, bool) {
 	defer this.mu.RUnlock()
 
 	if this.data_length < n {
-		return this.data[:], false
+		result := make([]D, this.data_length)
+		copy(result, this.data[:this.data_length])
+		return result, false
 	}
 
-	return this.data[:n], true
+	result := make([]D, n)
+	copy(result, this.data[:n])
+	return result, true
 }
 
 func (this *RingBuffer[S, D]) Last(n S) ([]D, bool) {
@@ -150,10 +171,14 @@ func (this *RingBuffer[S, D]) Last(n S) ([]D, bool) {
 	defer this.mu.RUnlock()
 
 	if this.data_length < n {
-		return this.data[:], false
+		result := make([]D, this.data_length)
+		copy(result, this.data[:this.data_length])
+		return result, false
 	}
 
-	return this.data[this.data_length-n:], true
+	result := make([]D, n)
+	copy(result, this.data[this.data_length-n:this.data_length])
+	return result, true
 }
 
 func NewRingBuffer[S UnsignedSeq, T Seqable[S]](max_data_length S) *RingBuffer[S, T] {

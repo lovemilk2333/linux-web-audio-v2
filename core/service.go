@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"net/http"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -18,23 +18,26 @@ import (
 	"go.uber.org/zap"
 )
 
-var upgrader = &websocket.Upgrader{}
+var upgrader = &websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		// TODO check origin
+		return true
+	},
+}
 
 const OPUS_FRAME_DURATION = time.Microsecond * 2500 // 2.5ms
-const OPUS_BIT_DEPTH = uint(unsafe.Sizeof(float32(0)))
-const OPUS_DURATION_BASE = 400 // 1/400s = 2.5ms
+const OPUS_DURATION_BASE = 400                      // 1/400s = 2.5ms
 
 type OpusSizer struct {
 	Sample   uint
 	Channels uint
-	BitDepth uint
 	// duration = 2.5ms * `DurationRate`
 	DurationRate uint
 	Bitrate      uint
 }
 
 func (this *OpusSizer) PCMFrameLength() uint {
-	return (this.Sample * this.DurationRate) * this.Channels * this.BitDepth / OPUS_DURATION_BASE
+	return (this.Sample * this.DurationRate) * this.Channels / OPUS_DURATION_BASE
 }
 
 // func (this *OpusSizer) OpusFrameLength() uint {
@@ -46,7 +49,6 @@ func NewOpusSizer(sample uint, channels uint, bitrate uint, duration_rate uint) 
 		Sample:       sample,
 		Channels:     channels,
 		Bitrate:      bitrate,
-		BitDepth:     OPUS_BIT_DEPTH,
 		DurationRate: duration_rate,
 	}
 
@@ -87,7 +89,7 @@ type Service struct {
 	pcm_buffer   []float32
 	opus_buffer  []byte
 	audio_seq    uint16
-	audio_buffer RingBuffer[uint16, *OpusFrame]
+	audio_buffer *RingBuffer[uint16, *OpusFrame]
 	clients      map[*websocket.Conn]*ctx.ClientContext
 	// min length for opus encode pmc
 	pcm_frame_length uint
@@ -135,7 +137,8 @@ func (this *Service) Init() error {
 	this.pcm_buffer = make([]float32, 0, this.pcm_frame_length*2)
 	this.opus_buffer = make([]byte, 1024)
 	// 1000ms = 2.5ms * 400
-	this.audio_buffer = RingBuffer[uint16, *OpusFrame]{}
+
+	this.audio_buffer = NewRingBuffer[uint16, *OpusFrame](uint16(this.buffer_rate))
 	audio_lock := this.audio_buffer.GetLock()
 
 	callback := pulse.Float32Writer(
@@ -190,9 +193,9 @@ func (this *Service) Init() error {
 
 	stream, err := client.NewRecord(
 		callback,
-		pulse.RecordLatency(float64(DURATION_RATE)/1000),
 		pulse.RecordSampleRate(SAMPLE_RATE),
 		pulse.RecordStereo,
+		pulse.RecordLatency(float64(DURATION_RATE)/OPUS_DURATION_BASE),
 		pulse.RecordMonitor(sink),
 	)
 	if err != nil {
@@ -246,6 +249,7 @@ func (this *Service) ws_decode_pocket(ctx *ctx.ClientContext, data []byte) (pock
 		}
 
 		handshake.Type = pocket.POCKET_C_HANDSHAKE
+		handshake.Ctx = ctx
 		if err := handshake.Check(); err != nil {
 			return nil, err
 		}
@@ -258,6 +262,7 @@ func (this *Service) ws_decode_pocket(ctx *ctx.ClientContext, data []byte) (pock
 		}
 
 		close.Type = pocket.POCKET_CLOSE
+		close.Ctx = ctx
 		close.Source = "client2server"
 		return &close, nil
 	case pocket.POCKET_C_BUFFER:
@@ -267,6 +272,7 @@ func (this *Service) ws_decode_pocket(ctx *ctx.ClientContext, data []byte) (pock
 		}
 
 		btl.Type = pocket.POCKET_C_BUFFER
+		btl.Ctx = ctx
 		return &btl, nil
 	default:
 		return nil, fmt.Errorf("unknown pocket type: %d", pocket_type)
@@ -305,9 +311,7 @@ func (this *Service) ws_encode_pocket(ctx *ctx.ClientContext, pkt pocket.Pocket)
 		compressed_length = payload_length
 	}
 
-	compressed = append(compressed, 0, 0)
-
-	binary.BigEndian.PutUint16(compressed[compressed_length:], pocket_type)
+	compressed = binary.BigEndian.AppendUint16(compressed, pocket_type)
 
 	return compressed, nil
 }
@@ -321,20 +325,26 @@ func (this *Service) ws_send_pocket(ctx *ctx.ClientContext, pkt pocket.Pocket) e
 	return ctx.Conn.WriteMessage(websocket.BinaryMessage, data)
 }
 
-func (this *Service) ws_build_opus(frames []*OpusFrame) *pocket.Opus {
+func (this *Service) ws_build_opus(ctx *ctx.ClientContext, frames []*OpusFrame) *pocket.Opus {
 	payload := make([]byte, 0, 1024)
 	pkt := &pocket.Opus{
-		Type:    pocket.POCKET_S_OPUS,
-		Payload: payload,
+		Type: pocket.POCKET_S_OPUS,
+		Ctx:  ctx,
 	}
 
 	for _, frame := range frames {
-		frame_length := len(frames)
-		payload = append(payload, byte(uint8(frame_length)))
+		if frame == nil {
+			ctx.Logger.Warn("nil opus frame")
+			continue
+		}
+
+		frame_length := len(frame.data)
+		payload = append(payload, uint8(frame_length))
 		payload = binary.BigEndian.AppendUint16(payload, frame.seq)
 		payload = append(payload, frame.data...)
 	}
 
+	pkt.Payload = payload
 	return pkt
 }
 
@@ -345,13 +355,13 @@ func (this *Service) ws_send_opus(ctx *ctx.ClientContext, frames []*OpusFrame) e
 	}
 
 	start := time.Now()
-	err := this.ws_send_pocket(ctx, this.ws_build_opus(frames))
+	err := this.ws_send_pocket(ctx, this.ws_build_opus(ctx, frames))
 	if err != nil {
 		return err
 	}
 	this.latency.LastSend.Store(int64(time.Since(start)))
 
-	ctx.CurrentSeq = frames[0].seq
+	ctx.CurrentSeq = frames[len(frames)-1].seq
 	ctx.CurrentBuffer += uint16(frames_length)
 
 	return nil
@@ -407,7 +417,7 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 	pkt, err := this.ws_decode_pocket(client_ctx, data)
 	if err != nil {
 		close_reason = "invalid handshake pocket"
-		client_logger.Error("invalid handshake pocket", zap.Error(err))
+		client_logger.Warn("invalid handshake pocket", zap.Error(err))
 		return
 	}
 
@@ -429,9 +439,12 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 		}
 	} else {
 		close_reason = "invalid handshake pocket"
-		client_logger.Errorf("invalid handshake pocket: %+v", pkt)
+		client_logger.Warnf("invalid handshake pocket: %+v", pkt)
 		return
 	}
+
+	client_logger = this.logger.With(zap.Object("client", client_ctx))
+	client_ctx.Logger = client_logger
 
 	go_ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -472,6 +485,7 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 	client_ctx.State = ctx.CLIENT_STATE_READY
 
 	ticker := time.NewTicker(OPUS_FRAME_DURATION)
+	defer ticker.Stop()
 	for range ticker.C {
 		select {
 		case pkt, ok := <-recv:
@@ -515,15 +529,17 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 			frames, full_range = this.audio_buffer.Last(client_ctx.TargetBuffer)
 			client_ctx.State = ctx.CLIENT_STATE_STABLE
 			if !full_range {
-				this.logger.Warnf("cannot all last %d opus frames whiling sending POCKET_S_OPUS", client_ctx.TargetBuffer)
+				client_logger.Warnf("cannot get all last %d opus frames whiling sending POCKET_S_OPUS", client_ctx.TargetBuffer)
 			}
+			client_logger = this.logger.With(zap.Object("client", client_ctx))
+			client_ctx.Logger = client_logger
 		case ctx.CLIENT_STATE_STABLE:
 			frames, full_range = this.audio_buffer.GetGreater(client_ctx.CurrentSeq)
 			if !full_range {
-				this.logger.Warnf("cannot all seq >= %d opus frames (count: %d) whiling sending POCKET_S_OPUS", client_ctx.CurrentSeq, len(frames))
+				client_logger.Warnf("cannot get all seq >= %d opus frames (count: %d) whiling sending POCKET_S_OPUS", client_ctx.CurrentSeq, len(frames))
 			}
 		default:
-			this.logger.Warnf("invalid client state whiling sending POCKET_S_OPUS: %d", client_ctx.State)
+			client_logger.Warnf("invalid client state whiling sending POCKET_S_OPUS: %d", client_ctx.State)
 			continue
 		}
 
@@ -532,7 +548,7 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 			this.logger.Warnf("cannot send POCKET_S_OPUS", zap.Error(err))
 		}
 
-		// 	Opus        atomic.Int64
+		// Opus        atomic.Int64
 		// AudioBuffer atomic.Int64
 		// LastSend    atomic.Int64
 		this.logger.Debugf("latency: Opus: %v, AudioBuffer: %v, LastSend: %v", this.latency.Opus.Load(), this.latency.AudioBuffer.Load(), this.latency.LastSend.Load())
