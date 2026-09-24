@@ -27,6 +27,23 @@ var upgrader = &websocket.Upgrader{
 
 const OPUS_FRAME_DURATION = time.Microsecond * 2500 // 2.5ms
 const OPUS_DURATION_BASE = 400                      // 1/400s = 2.5ms
+const LATENCY_REPORT_INTERVAL = 250 * time.Millisecond
+
+func buffer_watermarks(target uint16) (uint16, uint16) {
+	lower := target
+	extra := (uint32(target) + 1) / 2
+	if extra > 10 {
+		extra = 10
+	}
+	upper := uint32(target) + extra
+	if upper > uint32(^uint16(0)) {
+		upper = uint32(^uint16(0))
+	}
+	if upper < uint32(lower) {
+		upper = uint32(lower)
+	}
+	return lower, uint16(upper)
+}
 
 type OpusSizer struct {
 	Sample   uint
@@ -325,7 +342,12 @@ func (this *Service) ws_send_pocket(ctx *ctx.ClientContext, pkt pocket.Pocket) e
 	}
 
 	ctx.Conn.SetWriteDeadline(time.Now().Add(WS_WRITE_DEADLINE))
-	return ctx.Conn.WriteMessage(websocket.BinaryMessage, data)
+	start := time.Now()
+	err = ctx.Conn.WriteMessage(websocket.BinaryMessage, data)
+	if pkt.GetType() == pocket.POCKET_S_OPUS {
+		this.latency.WsSend.Store(int64(time.Since(start)))
+	}
+	return err
 }
 
 func (this *Service) ws_build_opus(ctx *ctx.ClientContext, frames []*OpusFrame) *pocket.Opus {
@@ -358,12 +380,10 @@ func (this *Service) ws_send_opus(ctx *ctx.ClientContext, frames []*OpusFrame) e
 		return nil
 	}
 
-	start := time.Now()
 	err := this.ws_send_pocket(ctx, this.ws_build_opus(ctx, frames))
 	if err != nil {
 		return err
 	}
-	this.latency.WsSend.Store(int64(time.Since(start)))
 
 	ctx.CurrentSeq = frames[len(frames)-1].seq
 	ctx.CurrentBuffer += uint16(frames_length)
@@ -459,6 +479,13 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 
 	close_reason = ""
 	recv := make(chan pocket.Pocket, 16)
+	wake := make(chan struct{}, 1)
+	notify := func() {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
 
 	go func() {
 		for {
@@ -476,6 +503,7 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 						Reason: err.Error(),
 						Source: "server-internal",
 					}
+					notify()
 					return
 				}
 
@@ -486,92 +514,152 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 				}
 
 				recv <- pkt
+				notify()
 			}
 		}
 	}()
 
 	client_ctx.State = ctx.CLIENT_STATE_READY
+	client_ctx.Logger = this.logger.With(zap.Object("client", client_ctx))
+	client_logger = client_ctx.Logger
+	lower_watermark, upper_watermark := buffer_watermarks(client_ctx.TargetBuffer)
+	last_buffer_update := time.Now()
+	next_latency_report := time.Now().Add(LATENCY_REPORT_INTERVAL)
+	next_wake := time.Now()
+	report_latency_on_ready := true
 
-	ticker := time.NewTicker(OPUS_FRAME_DURATION)
-	defer ticker.Stop()
-	for range ticker.C {
-		select {
-		case pkt, ok := <-recv:
-			if !ok {
-				break
+	for {
+		wake_at := next_wake
+		if next_latency_report.Before(wake_at) {
+			wake_at = next_latency_report
+		}
+		if delay := time.Until(wake_at); delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-wake:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 			}
+		}
+		now := time.Now()
+		if client_ctx.State == ctx.CLIENT_STATE_STABLE {
+			elapsed_frames := uint16(min(uint64(now.Sub(last_buffer_update)/OPUS_FRAME_DURATION), uint64(client_ctx.CurrentBuffer)))
+			client_ctx.CurrentBuffer -= elapsed_frames
+		}
+		last_buffer_update = now
 
-			switch typed_pkt := pkt.(type) {
-			case *pocket.Handshake: // handshake again means re-config
-				new_compressor, err := typed_pkt.GetCompressor()
-				if err == nil {
+		should_send_latency := !now.Before(next_latency_report)
+
+		for {
+			select {
+			case pkt := <-recv:
+				switch typed_pkt := pkt.(type) {
+				case *pocket.Handshake:
+					new_compressor, err := typed_pkt.GetCompressor()
+					if err != nil {
+						client_logger.Warn("cannot update client compressor", zap.Error(err))
+						continue
+					}
 					client_ctx.Compressor = new_compressor
+					client_ctx.CurrentBuffer = 0
+					client_ctx.CurrentSeq = 0
+					client_ctx.TargetBuffer = uint16(min(typed_pkt.TargetBuffer, this.audio_buffer.data_cap))
+					lower_watermark, upper_watermark = buffer_watermarks(client_ctx.TargetBuffer)
+					client_ctx.State = ctx.CLIENT_STATE_READY
+					report_latency_on_ready = true
+					err = this.ws_send_pocket(client_ctx, &pocket.Handshake{
+						Type:         pocket.POCKET_S_R_HANDSHAKE,
+						Ctx:          client_ctx,
+						Compression:  client_ctx.Compressor.Ident(),
+						TargetBuffer: client_ctx.TargetBuffer,
+					})
+					if err != nil {
+						client_logger.Warn("cannot send re-config handshake response", zap.Error(err))
+						return
+					}
+					client_logger.Info("client re-config handshake", zap.String("compression", client_ctx.Compressor.Ident()), zap.Uint16("target-buffer", client_ctx.TargetBuffer))
+					last_buffer_update = time.Now()
+				case *pocket.Close:
+					this.logger.Infof("received close pocket (source: %s): %s", typed_pkt.Source, typed_pkt.Reason)
+					conn.Close()
+					return
+				case *pocket.Buffer:
+					client_ctx.CurrentBuffer = min(typed_pkt.CurrentBuffer, upper_watermark)
+					client_ctx.CurrentSeq = typed_pkt.CurrentSeq
+					last_buffer_update = time.Now()
 				}
-				client_ctx.CurrentBuffer = 0
-				client_ctx.TargetBuffer = uint16(min(typed_pkt.TargetBuffer, this.audio_buffer.data_cap))
+			default:
+				goto controls_drained
+			}
+		}
 
-				err = this.ws_send_pocket(client_ctx, &pocket.Handshake{
-					Type:         pocket.POCKET_S_R_HANDSHAKE,
-					Ctx:          client_ctx,
-					Compression:  client_ctx.Compressor.Ident(),
-					TargetBuffer: client_ctx.TargetBuffer,
-				})
-
-				client_ctx.Logger.Info("")
-
-				if err != nil {
-					client_logger.Warn("cannot send re-config handshake (response) pocket", zap.Error(err))
-				} else {
-					client_ctx.Logger.Info("client re-config handshake", zap.String("compression", client_ctx.Compressor.Ident()), zap.Uint16("target-buffer", client_ctx.TargetBuffer))
-				}
-			case *pocket.Close:
-				this.logger.Infof("received close pocket (source: %s): %s", typed_pkt.Source, typed_pkt.Reason)
-				conn.Close()
+	controls_drained:
+		if should_send_latency || client_ctx.State == ctx.CLIENT_STATE_READY && report_latency_on_ready {
+			err := this.ws_send_pocket(client_ctx, &pocket.Latency{
+				Type:        pocket.POCKET_S_LATENCY,
+				Ctx:         client_ctx,
+				Opus:        this.latency.Opus.Load(),
+				AudioBuffer: this.latency.AudioBuffer.Load(),
+				WsSend:      this.latency.WsSend.Load(),
+			})
+			if err != nil {
+				client_logger.Warn("cannot send latency pocket", zap.Error(err))
 				return
-			case *pocket.Buffer:
-				client_ctx.CurrentBuffer = typed_pkt.CurrentBuffer
-				client_ctx.CurrentSeq = typed_pkt.CurrentSeq
 			}
-		default: // continue loop
+			next_latency_report = time.Now().Add(LATENCY_REPORT_INTERVAL)
+			if client_ctx.State == ctx.CLIENT_STATE_READY {
+				report_latency_on_ready = false
+			}
 		}
 
-		var frames []*OpusFrame
-		var full_range bool
-		switch client_ctx.State {
-		case ctx.CLIENT_STATE_READY:
-			frames, full_range = this.audio_buffer.Last(client_ctx.TargetBuffer)
-			client_ctx.State = ctx.CLIENT_STATE_STABLE
+		if client_ctx.State == ctx.CLIENT_STATE_READY {
+			var enough_frames []*OpusFrame
+			if this.audio_threshold > 0 {
+				enough_frames, _ = this.audio_buffer.Last(uint16(min(this.audio_threshold, uint(^uint16(0)))))
+			}
+			if this.audio_threshold == 0 || len(enough_frames) >= int(this.audio_threshold) {
+				frames, full_range := this.audio_buffer.Last(client_ctx.TargetBuffer)
+				if !full_range {
+					client_logger.Warnf("cannot get enough last opus frames while sending POCKET_S_OPUS: %d < %d", len(frames), client_ctx.TargetBuffer)
+				}
+				if len(frames) > 0 {
+					if err := this.ws_send_opus(client_ctx, frames); err != nil {
+						client_logger.Warn("cannot send initial opus frames", zap.Error(err))
+						return
+					}
+					client_ctx.State = ctx.CLIENT_STATE_STABLE
+					last_buffer_update = time.Now()
+				}
+			}
+		} else if client_ctx.State == ctx.CLIENT_STATE_STABLE && client_ctx.CurrentBuffer <= lower_watermark {
+			frames, full_range := this.audio_buffer.GetGreater(client_ctx.CurrentSeq)
 			if !full_range {
-				client_logger.Warnf("cannot get enough last opus frames whiling sending POCKET_S_OPUS: %d < %d", len(frames), client_ctx.TargetBuffer)
+				client_logger.Warnf("cannot get enough frames after sequence %d while sending POCKET_S_OPUS", client_ctx.CurrentSeq)
 			}
-			client_logger = this.logger.With(zap.Object("client", client_ctx))
-			client_ctx.Logger = client_logger
-		case ctx.CLIENT_STATE_STABLE:
-			frames, full_range = this.audio_buffer.GetGreater(client_ctx.CurrentSeq)
-			if !full_range {
-				client_logger.Warnf("cannot get enough seq >= %d opus frames whiling sending POCKET_S_OPUS", client_ctx.CurrentSeq, len(frames))
+			available := len(frames)
+			threshold := int(min(this.audio_threshold, uint(^uint16(0))))
+			if available >= threshold {
+				batch_size := min(available, int(upper_watermark-client_ctx.CurrentBuffer))
+				if batch_size > 0 {
+					if err := this.ws_send_opus(client_ctx, frames[:batch_size]); err != nil {
+						client_logger.Warn("cannot send opus frames", zap.Error(err))
+						return
+					}
+					last_buffer_update = time.Now()
+				}
 			}
-		default:
-			client_logger.Warnf("invalid client state whiling sending POCKET_S_OPUS: %d", client_ctx.State)
-			continue
 		}
 
-		if len(frames) == 0 || len(frames) < int(this.audio_threshold) {
-			continue
+		wait_frames := int(client_ctx.CurrentBuffer) - int(lower_watermark)
+		if wait_frames < 1 {
+			wait_frames = 1
 		}
-
-		// TODO calc sending rate from `TargetBuffer` and client report
-		// TODO report latencies to client
-
-		err := this.ws_send_opus(client_ctx, frames)
-		if err != nil {
-			this.logger.Warnf("cannot send POCKET_S_OPUS", zap.Error(err))
-		}
-
-		// Opus        atomic.Int64
-		// AudioBuffer atomic.Int64
-		// WsSend    atomic.Int64
-		this.logger.Debugf("latency: Opus: %v, AudioBuffer: %v, WsSend: %v", this.latency.Opus.Load(), this.latency.AudioBuffer.Load(), this.latency.WsSend.Load())
+		next_wake = time.Now().Add(time.Duration(wait_frames) * OPUS_FRAME_DURATION)
 	}
 }
 

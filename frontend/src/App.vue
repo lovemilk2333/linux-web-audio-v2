@@ -6,6 +6,7 @@ import {
   PocketType,
   decodeClose,
   decodeHandshakeInfo,
+  decodeLatency,
   decodeOpusFrames,
   decodePocketWithCompression,
   encodeBufferWithCompression,
@@ -22,7 +23,13 @@ const warning = ref('')
 const receivedFrames = ref(0)
 const underruns = ref(0)
 const droppedPackets = ref(0)
-const bufferRate = ref(4)
+const bufferedFrames = ref(0)
+const decodeLatencyMs = ref<number | null>(null)
+const opusLatencyMs = ref<number | null>(null)
+const audioBufferLatencyMs = ref<number | null>(null)
+const wsSendLatencyMs = ref<number | null>(null)
+const audioOutputLatencyMs = ref(0)
+const bufferRate = ref(10)
 const selectedCompression = ref<Compression>('zstd:1')
 const streamAddress = ref('')
 const negotiatedBuffer = ref<number | null>(null)
@@ -30,6 +37,13 @@ const sessionActive = ref(false)
 
 const bufferDuration = computed(() => `${(bufferRate.value * 2.5).toFixed(1)} ms`)
 const negotiatedDuration = computed(() => negotiatedBuffer.value === null ? '—' : `${(negotiatedBuffer.value * 2.5).toFixed(1)} ms`)
+const currentBufferDuration = computed(() => `${(bufferedFrames.value * 2.5).toFixed(1)} ms`)
+const playbackLatencyMs = computed(() => bufferedFrames.value * 2.5 + audioOutputLatencyMs.value)
+const bufferWatermarkLabel = computed(() => {
+  if (negotiatedBuffer.value === null) return '等待握手协商'
+  const watermarks = getBufferWatermarks(negotiatedBuffer.value)
+  return `触发 ${watermarks.lower} 帧 · 补至 ${watermarks.upper} 帧`
+})
 const sliderFill = computed(() => `${((bufferRate.value - 1) / 399) * 100}%`)
 const statusLabel = computed(() => ({
   idle: '未连接', preparing: '准备中', connecting: '连接中', handshaking: '握手中',
@@ -47,7 +61,6 @@ type Session = {
   timeout: ReturnType<typeof setTimeout> | null
   lastSequence: number | null
   receivedFrames: number
-  lastReport: number
   lastDisplay: number
   handshakeComplete: boolean
   resuming: boolean
@@ -68,6 +81,15 @@ function getStreamUrl() {
     throw new Error('流地址必须使用 http(s) 或 ws(s) 协议')
   }
   return url
+}
+
+function getBufferWatermarks(target: number) {
+  const lower = target
+  const extra = Math.min(10, Math.ceil(target * 0.5))
+  return {
+    lower,
+    upper: Math.min(0xffff, target + extra),
+  }
 }
 
 function loadWorklet(context: AudioContext) {
@@ -130,7 +152,10 @@ function handleAudio(session: Session, payload: Uint8Array) {
     session.lastSequence = frame.sequence
     if (!playing.value || session.resuming) continue
     if (!session.decoder || !session.node) throw new Error('音频播放器尚未准备就绪')
+    const decodeStart = performance.now()
     const interleaved = session.decoder.decodeFloat(frame.data)
+    const elapsed = performance.now() - decodeStart
+    decodeLatencyMs.value = decodeLatencyMs.value === null ? elapsed : decodeLatencyMs.value * 0.8 + elapsed * 0.2
     if (interleaved.length === 0) continue
     session.node.port.postMessage({ type: 'PCM_DATA', interleaved, sequence: frame.sequence }, [interleaved.buffer])
     session.receivedFrames++
@@ -152,6 +177,12 @@ async function start() {
   receivedFrames.value = 0
   underruns.value = 0
   droppedPackets.value = 0
+  bufferedFrames.value = 0
+  decodeLatencyMs.value = null
+  opusLatencyMs.value = null
+  audioBufferLatencyMs.value = null
+  wsSendLatencyMs.value = null
+  audioOutputLatencyMs.value = 0
   warning.value = ''
 
   let context: AudioContext
@@ -173,7 +204,6 @@ async function start() {
     timeout: null,
     lastSequence: null,
     receivedFrames: 0,
-    lastReport: 0,
     lastDisplay: 0,
     handshakeComplete: false,
     resuming: false,
@@ -204,24 +234,24 @@ async function start() {
       outputChannelCount: [2],
     })
     session.node = node
-    node.port.onmessage = (event: MessageEvent<{ type: string; bufferedPackets: number; sequence: number | null; underruns: number; droppedPackets: number }>) => {
+    node.port.onmessage = (event: MessageEvent<{ type: string; bufferedFrames: number; sequence: number | null; underruns: number; droppedPackets: number; lowWatermark: boolean }>) => {
       if (active !== session || event.data.type !== 'BUFFER_STATUS') return
       underruns.value = event.data.underruns
       droppedPackets.value = event.data.droppedPackets
-      if (event.data.sequence === null) return
-      const socket = session.socket
-      if (!socket || socket.readyState !== WebSocket.OPEN || !session.handshakeComplete) return
-      const now = performance.now()
-      if (now - session.lastReport < 100) return
-      session.receiveChain = session.receiveChain.then(async () => {
-        if (active !== session || socket.readyState !== WebSocket.OPEN || !session.handshakeComplete) return
-        socket.send(await encodeBufferWithCompression(
-          Math.min(event.data.bufferedPackets, 0xffff),
-          event.data.sequence!,
-          session.compression,
-        ))
-        session.lastReport = now
-      }).catch((err: unknown) => fail(session, err))
+      bufferedFrames.value = event.data.bufferedFrames
+      if (event.data.lowWatermark && event.data.sequence !== null) {
+        const socket = session.socket
+        if (socket?.readyState === WebSocket.OPEN && session.handshakeComplete) {
+          session.receiveChain = session.receiveChain.then(async () => {
+            if (active !== session || socket.readyState !== WebSocket.OPEN || !session.handshakeComplete) return
+            socket.send(await encodeBufferWithCompression(
+              Math.min(event.data.bufferedFrames, 0xffff),
+              event.data.sequence!,
+              session.compression,
+            ))
+          }).catch((err: unknown) => fail(session, err))
+        }
+      }
     }
     node.connect(context.destination)
 
@@ -257,6 +287,17 @@ async function start() {
             const handshake = decodeHandshakeInfo(payload)
             session.compression = handshake.compression
             negotiatedBuffer.value = handshake.targetBuffer
+            const watermarks = getBufferWatermarks(handshake.targetBuffer)
+            session.node?.port.postMessage({
+              type: 'SET_BUFFER_LIMIT',
+              lowerFrames: watermarks.lower,
+              upperFrames: watermarks.upper,
+              targetFrames: handshake.targetBuffer,
+            })
+            const outputLatency = 'outputLatency' in session.context
+              ? (session.context as AudioContext & { outputLatency: number }).outputLatency
+              : 0
+            audioOutputLatencyMs.value = (session.context.baseLatency + outputLatency) * 1000
             session.handshakeComplete = true
             if (session.timeout !== null) clearTimeout(session.timeout)
             session.timeout = null
@@ -278,6 +319,13 @@ async function start() {
           case PocketType.Close:
             fail(session, new Error(`服务端关闭连接：${decodeClose(payload)}`))
             break
+          case PocketType.Latency: {
+            const latency = decodeLatency(payload)
+            opusLatencyMs.value = latency.opus / 1_000_000
+            audioBufferLatencyMs.value = latency.audioBuffer / 1_000_000
+            wsSendLatencyMs.value = latency.wsSend / 1_000_000
+            break
+          }
           default:
             throw new Error(`不支持的服务端消息类型：${type}`)
         }
@@ -358,6 +406,7 @@ onUnmounted(() => {
           <span>约 {{ bufferDuration }}</span>
           <span class="muted">每帧 2.5 ms</span>
         </div>
+        <p class="field-note watermark-note">{{ bufferWatermarkLabel }}</p>
         <input
           v-model.number="bufferRate"
           class="range-input"
@@ -433,6 +482,39 @@ onUnmounted(() => {
         <span class="metric-label">服务端目标</span>
         <strong>{{ negotiatedBuffer ?? '—' }}</strong>
         <span class="metric-unit">{{ negotiatedBuffer === null ? '等待握手' : negotiatedDuration }}</span>
+      </div>
+    </section>
+
+    <section class="metrics-grid latency-grid" aria-label="音频延迟指标">
+      <div class="metric-card accent-blue">
+        <span class="metric-label">Opus 编码</span>
+        <strong>{{ opusLatencyMs === null ? '—' : opusLatencyMs.toFixed(3) }}</strong>
+        <span class="metric-unit">ms / frame</span>
+      </div>
+      <div class="metric-card accent-orange">
+        <span class="metric-label">AudioBuffer 写入</span>
+        <strong>{{ audioBufferLatencyMs === null ? '—' : audioBufferLatencyMs.toFixed(3) }}</strong>
+        <span class="metric-unit">ms</span>
+      </div>
+      <div class="metric-card accent-red">
+        <span class="metric-label">WsSend 调用</span>
+        <strong>{{ wsSendLatencyMs === null ? '—' : wsSendLatencyMs.toFixed(3) }}</strong>
+        <span class="metric-unit">ms · 非网络延迟</span>
+      </div>
+      <div class="metric-card accent-green">
+        <span class="metric-label">Opus 解码</span>
+        <strong>{{ decodeLatencyMs === null ? '—' : decodeLatencyMs.toFixed(3) }}</strong>
+        <span class="metric-unit">ms / frame</span>
+      </div>
+      <div class="metric-card accent-orange">
+        <span class="metric-label">估算播放延迟</span>
+        <strong>{{ playbackLatencyMs.toFixed(1) }}</strong>
+        <span class="metric-unit">ms · 含队列与输出延迟</span>
+      </div>
+      <div class="metric-card accent-blue">
+        <span class="metric-label">客户端缓冲</span>
+        <strong>{{ bufferedFrames }}</strong>
+        <span class="metric-unit">帧 · {{ currentBufferDuration }}</span>
       </div>
     </section>
 

@@ -1,6 +1,6 @@
 const MAX_BUFFERED_SAMPLES = 24000; // 500 ms at 48 kHz
-const PREFILL_SAMPLES = 1920;
 const FADE_SAMPLES = 256;
+const SAMPLES_PER_FRAME = 120;
 
 class PCMPlayerProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -11,6 +11,9 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
     this.bufferedSamples = 0;
     this.samplesSinceReport = 0;
     this.samplesPerPacket = 0;
+    this.lowWatermarkSamples = SAMPLES_PER_FRAME;
+    this.prefillSamples = SAMPLES_PER_FRAME * 16;
+    this.lowReportArmed = true;
     this.lastReceivedSequence = null;
     this.primed = false;
     this.fadeIn = 0;
@@ -21,7 +24,14 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
     this.droppedPackets = 0;
 
     this.port.onmessage = (event) => {
-      const { type, interleaved, sequence } = event.data;
+      const { type, interleaved, sequence, lowerFrames, targetFrames } = event.data;
+      if (type === "SET_BUFFER_LIMIT") {
+        this.lowWatermarkSamples = Math.max(1, lowerFrames) * SAMPLES_PER_FRAME;
+        this.prefillSamples = Math.min(8, Math.max(targetFrames, lowerFrames)) * SAMPLES_PER_FRAME;
+        this.lowReportArmed = this.bufferedSamples > this.lowWatermarkSamples;
+        this.maybeReportLowBuffer();
+        return;
+      }
       if (type === "CLEAR") {
         this.packetQueue = [];
         this.currentPacket = null;
@@ -32,6 +42,7 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
         this.fadeOut = 0;
         this.lastLeft = 0;
         this.lastRight = 0;
+        this.lowReportArmed = true;
         return;
       }
       if (type !== "PCM_DATA" || !interleaved || interleaved.length === 0 || interleaved.length % 2 !== 0) return;
@@ -45,7 +56,27 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
         this.bufferedSamples -= discarded.length / 2;
         this.droppedPackets++;
       }
+      if (this.bufferedSamples > this.lowWatermarkSamples) this.lowReportArmed = true;
+      this.maybeReportLowBuffer();
     };
+  }
+
+  postBufferStatus(lowWatermark = false) {
+    this.port.postMessage({
+      type: "BUFFER_STATUS",
+      bufferedFrames: Math.ceil(this.bufferedSamples / SAMPLES_PER_FRAME),
+      sequence: this.lastReceivedSequence,
+      underruns: this.underruns,
+      droppedPackets: this.droppedPackets,
+      lowWatermark,
+    });
+  }
+
+  maybeReportLowBuffer() {
+    if (this.lowReportArmed && this.lastReceivedSequence !== null && this.bufferedSamples <= this.lowWatermarkSamples) {
+      this.lowReportArmed = false;
+      this.postBufferStatus(true);
+    }
   }
 
   process(inputs, outputs) {
@@ -55,7 +86,7 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
     if (!leftChannel || !rightChannel) return true;
 
     for (let i = 0; i < leftChannel.length; i++) {
-      if (!this.primed && this.fadeOut === 0 && this.bufferedSamples >= PREFILL_SAMPLES) {
+      if (!this.primed && this.fadeOut === 0 && this.bufferedSamples >= this.prefillSamples) {
         this.primed = true;
         this.fadeIn = FADE_SAMPLES;
       }
@@ -100,16 +131,12 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
       }
     }
 
+    this.maybeReportLowBuffer();
+
     this.samplesSinceReport += leftChannel.length;
     if (this.samplesSinceReport >= 4800) {
       this.samplesSinceReport = 0;
-      this.port.postMessage({
-        type: "BUFFER_STATUS",
-        bufferedPackets: this.samplesPerPacket ? Math.ceil(this.bufferedSamples / this.samplesPerPacket) : 0,
-        sequence: this.lastReceivedSequence,
-        underruns: this.underruns,
-        droppedPackets: this.droppedPackets,
-      });
+      this.postBufferStatus();
     }
     return true;
   }

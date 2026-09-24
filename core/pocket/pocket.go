@@ -128,7 +128,7 @@ type Latency struct {
 	PocketBase  `bson:"-"`
 	Opus        int64 `bson:"o"`
 	AudioBuffer int64 `bson:"ab"`
-	LastSend    int64 `bson:"ls"`
+	WsSend      int64 `bson:"ws"`
 }
 
 /*

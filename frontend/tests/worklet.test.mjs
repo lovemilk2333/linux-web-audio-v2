@@ -73,3 +73,19 @@ test('counts dropped packets when the queue overflows', () => {
   assert.equal(player.bufferedSamples, 0)
   assert.equal(render(player).every((sample) => sample === 0), true)
 })
+
+test('reports low buffer once per downward crossing and rearms after refill', () => {
+  const player = createPlayer()
+  player.port.onmessage({ data: { type: 'SET_BUFFER_LIMIT', lowerFrames: 4, targetFrames: 8 } })
+  feed(player, 8)
+  player.port.messages.length = 0
+  for (let index = 0; index < 8; index++) render(player)
+  const reports = player.port.messages.filter((message) => message.lowWatermark)
+  assert.equal(reports.length, 1)
+  assert.equal(reports[0].bufferedFrames, 4)
+
+  feed(player, 8)
+  player.port.messages.length = 0
+  for (let index = 0; index < 15; index++) render(player)
+  assert.equal(player.port.messages.filter((message) => message.lowWatermark).length, 1)
+})

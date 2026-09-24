@@ -207,6 +207,19 @@ export function decodeClose(payload: Uint8Array): string {
   return typeof response.r === 'string' ? response.r : '未提供原因'
 }
 
+export type LatencyInfo = { opus: number; audioBuffer: number; wsSend: number }
+
+export function decodeLatency(payload: Uint8Array): LatencyInfo {
+  const response = deserialize(payload)
+  const opus = response.o
+  const audioBuffer = response.ab
+  const wsSend = response.ws
+  if (![opus, audioBuffer, wsSend].every(value => typeof value === 'number' && Number.isFinite(value) && value >= 0)) {
+    throw new Error('服务端延迟数据无效')
+  }
+  return { opus, audioBuffer, wsSend }
+}
+
 export type OpusFrame = { sequence: number; data: Uint8Array }
 
 export function decodeOpusFrames(payload: Uint8Array): OpusFrame[] {

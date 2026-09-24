@@ -12,7 +12,7 @@ example.com {
 	}
 
 	handle /backend* {
-		reverse_proxy 127.0.0.1:8642 {
+		reverse_proxy IP:8643 {
 			# reduce latency
 			flush_interval -1
 		}
@@ -20,6 +20,6 @@ example.com {
 
 	# other root
 	handle {
-		reverse_proxy 127.0.0.1:59090
+		reverse_proxy IP:59090
 	}
 }

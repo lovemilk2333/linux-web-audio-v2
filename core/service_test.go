@@ -42,6 +42,31 @@ func TestOpusFrameDuration(t *testing.T) {
 	}
 }
 
+func TestBufferWatermarks(t *testing.T) {
+	tests := []struct {
+		target uint16
+		lower  uint16
+		upper  uint16
+	}{
+		{target: 0, lower: 0, upper: 0},
+		{target: 1, lower: 1, upper: 2},
+		{target: 2, lower: 2, upper: 3},
+		{target: 3, lower: 3, upper: 5},
+		{target: 4, lower: 4, upper: 6},
+		{target: 5, lower: 5, upper: 8},
+		{target: 20, lower: 20, upper: 30},
+		{target: 21, lower: 21, upper: 31},
+		{target: 400, lower: 400, upper: 410},
+		{target: ^uint16(0), lower: ^uint16(0), upper: ^uint16(0)},
+	}
+	for _, test := range tests {
+		lower, upper := buffer_watermarks(test.target)
+		if lower != test.lower || upper != test.upper {
+			t.Errorf("bufferWatermarks(%d) = (%d, %d), want (%d, %d)", test.target, lower, upper, test.lower, test.upper)
+		}
+	}
+}
+
 func TestContinuousOpusAudio(t *testing.T) {
 	sizer, err := NewOpusSizer(SAMPLE_RATE, CHANNELS, OPUS_BITRATE, DURATION_RATE)
 	if err != nil {

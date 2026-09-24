@@ -5,6 +5,7 @@ import {
   PocketType,
   decodeClose,
   decodeHandshake,
+  decodeLatency,
   decodePocketWithCompression,
   decodeOpusFrames,
   decodePocket,
@@ -47,6 +48,15 @@ test('compresses and decompresses gzip pockets', async () => {
 test('rejects truncated and compressed pockets', () => {
   assert.throws(() => decodePocket(new ArrayBuffer(1)), /长度不足/)
   assert.throws(() => decodePocket(Uint8Array.from([0, 4]).buffer), /压缩/)
+})
+
+test('decodes server latency fields in nanoseconds', () => {
+  assert.deepEqual(decodeLatency(serialize({ o: 1_200_000, ab: 50_000, ws: 3_000_000 })), {
+    opus: 1_200_000,
+    audioBuffer: 50_000,
+    wsSend: 3_000_000,
+  })
+  assert.throws(() => decodeLatency(serialize({ o: -1, ab: 0, ws: 0 })), /延迟数据无效/)
 })
 
 test('splits multiple Opus frames and rejects invalid lengths', () => {
