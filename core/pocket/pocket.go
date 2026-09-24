@@ -57,7 +57,7 @@ type Handshake struct {
 	// like `zstd:3`, `gzip`
 	Compression string `bson:"c"`
 	// rate of `FRAME_DURATION`: 1 -> 2.5ms, 2 -> 5ms
-	TargetBuffer uint32 `bson:"tb"`
+	TargetBuffer uint16 `bson:"tb"`
 }
 
 func (this *Handshake) GetCompressor() (ctx.Compressor, error) {

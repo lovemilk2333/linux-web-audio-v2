@@ -85,13 +85,14 @@ type ServiceLatency struct {
 }
 
 type Service struct {
-	logger       *zap.SugaredLogger
-	buffer_rate  uint
-	pcm_buffer   []float32
-	opus_buffer  []byte
-	audio_seq    uint16
-	audio_buffer *RingBuffer[uint16, *OpusFrame]
-	clients      map[*websocket.Conn]*ctx.ClientContext
+	logger          *zap.SugaredLogger
+	buffer_rate     uint
+	audio_threshold uint
+	pcm_buffer      []float32
+	opus_buffer     []byte
+	audio_seq       uint16
+	audio_buffer    *RingBuffer[uint16, *OpusFrame]
+	clients         map[*websocket.Conn]*ctx.ClientContext
 	// min length for opus encode pmc
 	pcm_frame_length uint
 	sizer            *OpusSizer
@@ -429,16 +430,20 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 		client_ctx.State = ctx.CLIENT_STATE_POST_HANDSHAKE
 		client_ctx.Compressor, _ = handshake.GetCompressor()
 		client_ctx.CurrentBuffer = 0
-		client_ctx.TargetBuffer = uint16(min(handshake.TargetBuffer, uint32(this.audio_buffer.data_cap)))
+		client_ctx.TargetBuffer = uint16(min(handshake.TargetBuffer, this.audio_buffer.data_cap))
 
 		err := this.ws_send_pocket(client_ctx, &pocket.Handshake{
 			Type:         pocket.POCKET_S_R_HANDSHAKE,
 			Ctx:          client_ctx,
 			Compression:  client_ctx.Compressor.Ident(),
-			TargetBuffer: uint32(client_ctx.TargetBuffer),
+			TargetBuffer: client_ctx.TargetBuffer,
 		})
 		if err != nil {
+			close_reason = "handshake response send failed"
 			client_logger.Warn("cannot send handshake (response) pocket", zap.Error(err))
+			return
+		} else {
+			client_ctx.Logger.Info("client handshake", zap.String("compression", client_ctx.Compressor.Ident()), zap.Uint16("target-buffer", client_ctx.TargetBuffer))
 		}
 	} else {
 		close_reason = "invalid handshake pocket"
@@ -503,16 +508,21 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 					client_ctx.Compressor = new_compressor
 				}
 				client_ctx.CurrentBuffer = 0
-				client_ctx.TargetBuffer = uint16(min(typed_pkt.TargetBuffer, uint32(this.audio_buffer.data_cap)))
+				client_ctx.TargetBuffer = uint16(min(typed_pkt.TargetBuffer, this.audio_buffer.data_cap))
 
 				err = this.ws_send_pocket(client_ctx, &pocket.Handshake{
 					Type:         pocket.POCKET_S_R_HANDSHAKE,
 					Ctx:          client_ctx,
 					Compression:  client_ctx.Compressor.Ident(),
-					TargetBuffer: uint32(client_ctx.TargetBuffer),
+					TargetBuffer: client_ctx.TargetBuffer,
 				})
+
+				client_ctx.Logger.Info("")
+
 				if err != nil {
 					client_logger.Warn("cannot send re-config handshake (response) pocket", zap.Error(err))
+				} else {
+					client_ctx.Logger.Info("client re-config handshake", zap.String("compression", client_ctx.Compressor.Ident()), zap.Uint16("target-buffer", client_ctx.TargetBuffer))
 				}
 			case *pocket.Close:
 				this.logger.Infof("received close pocket (source: %s): %s", typed_pkt.Source, typed_pkt.Reason)
@@ -546,6 +556,10 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 			continue
 		}
 
+		if len(frames) == 0 || len(frames) < int(this.audio_threshold) {
+			continue
+		}
+
 		// TODO calc sending rate from `TargetBuffer` and client report
 		// TODO report latencies to client
 
@@ -562,11 +576,16 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 }
 
 func NewService(logger *zap.SugaredLogger, buffer_rate uint) (*Service, error) {
+	return NewServiceWithAudioThreshold(logger, buffer_rate, 4)
+}
+
+func NewServiceWithAudioThreshold(logger *zap.SugaredLogger, buffer_rate uint, audio_threshold uint) (*Service, error) {
 	service := &Service{
-		logger:      logger,
-		clients:     make(map[*websocket.Conn]*ctx.ClientContext),
-		buffer_rate: buffer_rate,
-		latency:     ServiceLatency{},
+		logger:          logger,
+		clients:         make(map[*websocket.Conn]*ctx.ClientContext),
+		buffer_rate:     buffer_rate,
+		audio_threshold: audio_threshold,
+		latency:         ServiceLatency{},
 	}
 
 	return service, service.Init()

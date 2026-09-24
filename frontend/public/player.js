@@ -1,6 +1,6 @@
 const MAX_BUFFERED_SAMPLES = 24000; // 500 ms at 48 kHz
-const PREFILL_SAMPLES = 960;
-const FADE_SAMPLES = 64;
+const PREFILL_SAMPLES = 1920;
+const FADE_SAMPLES = 256;
 
 class PCMPlayerProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -84,7 +84,9 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
       }
 
       const packet = this.currentPacket;
-      const scale = this.fadeIn > 0 ? (FADE_SAMPLES - this.fadeIn + 1) / FADE_SAMPLES : 1;
+      const scale = this.fadeIn > 0
+        ? Math.sin(((FADE_SAMPLES - this.fadeIn + 1) / FADE_SAMPLES) * Math.PI / 2)
+        : 1;
       leftChannel[i] = packet[this.currentOffset] * scale;
       rightChannel[i] = packet[this.currentOffset + 1] * scale;
       if (this.fadeIn > 0) this.fadeIn--;

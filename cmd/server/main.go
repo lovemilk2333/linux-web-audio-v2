@@ -23,7 +23,8 @@ var args struct {
 	BasePath string `arg:"-b,--base" help:"base url path which starts with '/'" default:"/backend/v2/"`
 	Listen   string `arg:"-l,--listen" help:"listen at" default:":8643"`
 	// 2.5ms * 400 = 1s
-	BufferRate uint `arg:"--buffer-rate,--buf" help:"opus buffer rate, which means duration = 2.5ms * this" default:"400"`
+	BufferRate     uint `arg:"--buffer-rate,--buf" help:"opus buffer rate, which means duration = 2.5ms * this" default:"400"`
+	AudioThreshold uint `arg:"--audio-threshold,--threshold" help:"minimum audio frames before sending a packet" default:"4"`
 }
 
 func check_args() error {
@@ -43,7 +44,7 @@ func main() {
 		log.Panicln(err)
 	}
 
-	service, err := core.NewService(logger, args.BufferRate)
+	service, err := core.NewServiceWithAudioThreshold(logger, args.BufferRate, args.AudioThreshold)
 	if err != nil {
 		logger.Fatal("cannot create/init service", zap.Error(err))
 	}

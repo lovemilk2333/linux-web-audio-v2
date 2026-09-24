@@ -1,27 +1,42 @@
 <script setup lang="ts">
-import { onUnmounted, ref } from 'vue'
+import { computed, onUnmounted, ref } from 'vue'
 import { createDecoder } from 'libopus-wasm'
 import playerWorkletUrl from '/player.js?url'
 import {
   PocketType,
   decodeClose,
-  decodeHandshake,
+  decodeHandshakeInfo,
   decodeOpusFrames,
-  decodePocket,
-  encodeBuffer,
+  decodePocketWithCompression,
+  encodeBufferWithCompression,
   encodeClose,
-  encodeHandshake,
+  encodeHandshakeWithCompression,
   isNewerSequence,
+  type Compression,
 } from './protocol'
 
-const status = ref<'idle' | 'preparing' | 'connecting' | 'handshaking' | 'waiting' | 'receiving' | 'paused' | 'error'>('idle')
+const status = ref<'idle' | 'preparing' | 'connecting' | 'handshaking' | 'waiting' | 'receiving' | 'error'>('idle')
 const playing = ref(false)
 const message = ref('点击开始以连接音频服务')
 const warning = ref('')
 const receivedFrames = ref(0)
 const underruns = ref(0)
 const droppedPackets = ref(0)
-const targetBuffer = 40
+const bufferRate = ref(4)
+const selectedCompression = ref<Compression>('zstd:1')
+const streamAddress = ref('')
+const negotiatedBuffer = ref<number | null>(null)
+const sessionActive = ref(false)
+
+const bufferDuration = computed(() => `${(bufferRate.value * 2.5).toFixed(1)} ms`)
+const negotiatedDuration = computed(() => negotiatedBuffer.value === null ? '—' : `${(negotiatedBuffer.value * 2.5).toFixed(1)} ms`)
+const sliderFill = computed(() => `${((bufferRate.value - 1) / 399) * 100}%`)
+const statusLabel = computed(() => ({
+  idle: '未连接', preparing: '准备中', connecting: '连接中', handshaking: '握手中',
+  waiting: '缓冲中', receiving: '播放中', error: '连接异常',
+}[status.value]))
+const compressionLabel = computed(() => selectedCompression.value === 'none' ? '不压缩' : selectedCompression.value)
+const actionLabel = computed(() => sessionActive.value ? '停止播放' : '开始播放')
 
 type Decoder = Awaited<ReturnType<typeof createDecoder>>
 type Session = {
@@ -36,13 +51,39 @@ type Session = {
   lastDisplay: number
   handshakeComplete: boolean
   resuming: boolean
+  compression: Compression
+  receiveChain: Promise<void>
 }
 
 let active: Session | null = null
+let sharedContext: AudioContext | null = null
+let workletModulePromise: Promise<void> | null = null
+
+function getStreamUrl() {
+  const address = streamAddress.value.trim() || '/backend/v2/stream'
+  const url = new URL(address, location.href)
+  if (url.protocol === 'http:') url.protocol = 'ws:'
+  else if (url.protocol === 'https:') url.protocol = 'wss:'
+  else if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
+    throw new Error('流地址必须使用 http(s) 或 ws(s) 协议')
+  }
+  return url
+}
+
+function loadWorklet(context: AudioContext) {
+  if (!workletModulePromise) {
+    workletModulePromise = context.audioWorklet.addModule(playerWorkletUrl).catch((error: unknown) => {
+      workletModulePromise = null
+      throw error
+    })
+  }
+  return workletModulePromise
+}
 
 function closeSession(session: Session) {
   if (active === session) {
     active = null
+    sessionActive.value = false
     playing.value = false
   }
   if (session.timeout !== null) clearTimeout(session.timeout)
@@ -69,7 +110,7 @@ function closeSession(session: Session) {
     session.node.disconnect()
     session.node = null
   }
-  void session.context.close().catch((err: unknown) => console.error('Failed to close audio context:', err))
+  void session.context.suspend().catch((err: unknown) => console.error('Failed to suspend audio context:', err))
   session.decoder?.free()
   session.decoder = null
 }
@@ -115,8 +156,9 @@ async function start() {
 
   let context: AudioContext
   try {
-    // Start the context while this click still counts as a user gesture.
-    context = new AudioContext({ sampleRate: 48000 })
+    // Resume the shared context while this click still counts as a user gesture.
+    context = sharedContext ?? new AudioContext({ sampleRate: 48000 })
+    sharedContext = context
   } catch (err) {
     status.value = 'error'
     message.value = err instanceof Error ? err.message : String(err)
@@ -135,16 +177,15 @@ async function start() {
     lastDisplay: 0,
     handshakeComplete: false,
     resuming: false,
+    compression: selectedCompression.value,
+    receiveChain: Promise.resolve(),
   }
   active = session
+  sessionActive.value = true
   playing.value = true
 
   try {
     await context.resume()
-    if (active !== session) return
-    if (!playing.value) await context.suspend()
-    if (active !== session) return
-    if (playing.value && context.state === 'suspended') await context.resume()
     if (active !== session) return
 
     const decoder = await createDecoder({ sampleRate: 48000, channels: 2 })
@@ -154,7 +195,7 @@ async function start() {
     }
     session.decoder = decoder
 
-    await context.audioWorklet.addModule(playerWorkletUrl)
+    await loadWorklet(context)
     if (active !== session) return
 
     const node = new AudioWorkletNode(context, 'pcm-player-processor', {
@@ -172,18 +213,19 @@ async function start() {
       if (!socket || socket.readyState !== WebSocket.OPEN || !session.handshakeComplete) return
       const now = performance.now()
       if (now - session.lastReport < 100) return
-      try {
-        socket.send(encodeBuffer(Math.min(event.data.bufferedPackets, 0xffff), event.data.sequence))
+      session.receiveChain = session.receiveChain.then(async () => {
+        if (active !== session || socket.readyState !== WebSocket.OPEN || !session.handshakeComplete) return
+        socket.send(await encodeBufferWithCompression(
+          Math.min(event.data.bufferedPackets, 0xffff),
+          event.data.sequence!,
+          session.compression,
+        ))
         session.lastReport = now
-      } catch (err) {
-        fail(session, err)
-      }
+      }).catch((err: unknown) => fail(session, err))
     }
     node.connect(context.destination)
 
-    const url = new URL('/backend/v2/stream', location.href)
-    url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const socket = new WebSocket(url)
+    const socket = new WebSocket(getStreamUrl())
     session.socket = socket
     socket.binaryType = 'arraybuffer'
     if (playing.value) {
@@ -195,7 +237,7 @@ async function start() {
     socket.onopen = () => {
       if (active !== session) return
       try {
-        socket.send(encodeHandshake(targetBuffer))
+        socket.send(encodeHandshakeWithCompression(bufferRate.value, session.compression))
         if (playing.value) {
           status.value = 'handshaking'
           message.value = '已连接，等待服务端握手…'
@@ -205,20 +247,22 @@ async function start() {
       }
     }
     socket.onmessage = (event: MessageEvent) => {
-      if (active !== session) return
-      try {
+      session.receiveChain = session.receiveChain.then(async () => {
+        if (active !== session) return
         if (!(event.data instanceof ArrayBuffer)) throw new Error('收到非二进制消息')
-        const { type, payload } = decodePocket(event.data)
+        const { type, payload } = await decodePocketWithCompression(event.data, session.compression)
         switch (type) {
           case PocketType.HandshakeResponse: {
             if (session.handshakeComplete) throw new Error('收到意外的握手响应')
-            const buffer = decodeHandshake(payload)
+            const handshake = decodeHandshakeInfo(payload)
+            session.compression = handshake.compression
+            negotiatedBuffer.value = handshake.targetBuffer
             session.handshakeComplete = true
             if (session.timeout !== null) clearTimeout(session.timeout)
             session.timeout = null
             if (playing.value) {
               status.value = 'waiting'
-              message.value = `握手完成，等待音频（服务端目标缓冲 ${buffer} 帧）`
+              message.value = `握手完成，等待音频（服务端目标缓冲 ${handshake.targetBuffer} 帧）`
             }
             break
           }
@@ -237,9 +281,7 @@ async function start() {
           default:
             throw new Error(`不支持的服务端消息类型：${type}`)
         }
-      } catch (err) {
-        fail(session, err)
-      }
+      }).catch((err: unknown) => fail(session, err))
     }
     socket.onerror = () => fail(session, new Error('WebSocket 连接错误'))
     socket.onclose = (event) => fail(session, new Error(`连接已断开（${event.code}）`))
@@ -248,65 +290,154 @@ async function start() {
   }
 }
 
-function pause() {
+function stop() {
   const session = active
-  if (!session || !playing.value) return
-  playing.value = false
+  if (!session) return
+  closeSession(session)
   warning.value = ''
-  status.value = 'paused'
-  message.value = '已暂停（连接保持中）'
-  session.node?.port.postMessage({ type: 'CLEAR' })
-  if (!session.resuming) {
-    void session.context.suspend().catch((err: unknown) => fail(session, err))
-  }
-}
-
-async function resume() {
-  const session = active
-  if (!session || playing.value || session.resuming) return
-  session.resuming = true
-  try {
-    session.decoder?.free()
-    session.decoder = null
-    const decoder = await createDecoder({ sampleRate: 48000, channels: 2 })
-    if (active !== session) {
-      decoder.free()
-      return
-    }
-    session.decoder = decoder
-    await session.context.resume()
-    if (active !== session) return
-    playing.value = true
-    warning.value = ''
-    status.value = session.handshakeComplete ? 'waiting' : (session.socket ? 'handshaking' : 'preparing')
-    message.value = session.handshakeComplete ? '已恢复，等待音频…' : '已恢复，正在连接音频服务…'
-  } catch (err) {
-    fail(session, err)
-  } finally {
-    session.resuming = false
-  }
+  negotiatedBuffer.value = null
+  status.value = 'idle'
+  message.value = '播放已停止，点击开始以重新连接'
 }
 
 function toggle() {
-  if (!active) void start()
-  else if (playing.value) pause()
-  else void resume()
+  if (active) stop()
+  else void start()
 }
 
 onUnmounted(() => {
   if (active) closeSession(active)
+  if (sharedContext) {
+    void sharedContext.close().catch((err: unknown) => console.error('Failed to close audio context:', err))
+    sharedContext = null
+    workletModulePromise = null
+  }
 })
 </script>
 
 <template>
-  <main>
-    <h1>Linux Web Audio 验证</h1>
-    <button type="button" @click="toggle">
-      {{ playing ? '暂停' : '开始' }}
-    </button>
-    <p role="status">{{ message }}</p>
-    <p v-if="receivedFrames">播放欠载 {{ underruns }} 次；溢出丢包 {{ droppedPackets }} 个</p>
-    <p v-if="warning" role="alert">{{ warning }}</p>
-    <p v-if="status === 'error'">请检查服务端日志及连接状态。</p>
+  <main class="page-shell">
+    <header class="topbar">
+      <div class="brand-lockup">
+        <span class="brand-mark" aria-hidden="true">◌</span>
+        <div>
+          <p class="eyebrow">LINUX WEB AUDIO</p>
+          <h1>音频流控制台</h1>
+        </div>
+      </div>
+      <div class="status-chip" :class="`status-${status}`">
+        <span class="status-dot" aria-hidden="true"></span>
+        {{ statusLabel }}
+      </div>
+    </header>
+
+    <section class="hero-card">
+      <div class="hero-copy">
+        <p class="eyebrow">实时音频链路</p>
+        <h2>稳定、低延迟地播放系统音频</h2>
+        <p class="hero-description">通过 WebSocket 接收 Opus 音频，在浏览器中解码并交给 AudioWorklet 播放。</p>
+      </div>
+      <div class="signal-visual" aria-hidden="true">
+        <i v-for="bar in 18" :key="bar" :style="{ '--bar-height': `${24 + ((bar * 17) % 52)}%` }"></i>
+      </div>
+    </section>
+
+    <div class="dashboard-grid">
+      <section class="panel buffer-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">BUFFER RATE</p>
+            <h3>目标缓冲</h3>
+          </div>
+          <div class="buffer-value">
+            <strong>{{ bufferRate }}</strong>
+            <span>帧</span>
+          </div>
+        </div>
+        <div class="duration-readout">
+          <span>约 {{ bufferDuration }}</span>
+          <span class="muted">每帧 2.5 ms</span>
+        </div>
+        <input
+          v-model.number="bufferRate"
+          class="range-input"
+          type="range"
+          min="1"
+          max="400"
+          step="1"
+          :style="{ '--range-fill': sliderFill }"
+          :disabled="sessionActive"
+          aria-label="目标缓冲帧数"
+        >
+        <div class="range-labels"><span>1 帧</span><span>400 帧</span></div>
+        <p class="field-note">连接建立后锁定设置；重新连接即可应用新的缓冲目标。</p>
+      </section>
+
+      <section class="panel control-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">PLAYBACK</p>
+            <h3>播放控制</h3>
+          </div>
+          <span class="connection-icon" :class="{ active: sessionActive }" aria-hidden="true">↗</span>
+        </div>
+        <p class="message" role="status">{{ message }}</p>
+        <button class="primary-button" type="button" @click="toggle">
+          <span class="button-icon">{{ sessionActive ? '■' : '▶' }}</span>
+          {{ actionLabel }}
+        </button>
+        <div class="setting-row address-row" style="margin-top: 2rem;">
+          <label for="stream-address">流地址</label>
+          <input
+            id="stream-address" 
+            v-model="streamAddress"
+            class="setting-input"
+            type="text"
+            placeholder="默认：/backend/v2/stream"
+            :disabled="sessionActive"
+            autocomplete="url"
+            spellcheck="false"
+          >
+        </div>
+        <p class="field-note address-note">支持相对路径或完整 URL；留空使用默认地址。</p>
+        <div class="setting-row">
+          <label for="compression">传输压缩</label>
+          <select id="compression" v-model="selectedCompression" :disabled="sessionActive">
+            <option value="zstd:1">zstd:1（推荐）</option>
+            <option value="zstd:3">zstd:3（高压缩）</option>
+            <option value="lz4">lz4（低延迟）</option>
+            <option value="gzip">gzip</option>
+            <option value="none">不压缩</option>
+          </select>
+        </div>
+      </section>
+    </div>
+
+    <section class="metrics-grid" aria-label="实时指标">
+      <div class="metric-card accent-blue">
+        <span class="metric-label">已接收音频帧</span>
+        <strong>{{ receivedFrames.toLocaleString() }}</strong>
+        <span class="metric-unit">frames</span>
+      </div>
+      <div class="metric-card accent-orange">
+        <span class="metric-label">播放欠载</span>
+        <strong>{{ underruns.toLocaleString() }}</strong>
+        <span class="metric-unit">次数</span>
+      </div>
+      <div class="metric-card accent-red">
+        <span class="metric-label">溢出丢包</span>
+        <strong>{{ droppedPackets.toLocaleString() }}</strong>
+        <span class="metric-unit">packets</span>
+      </div>
+      <div class="metric-card accent-green">
+        <span class="metric-label">服务端目标</span>
+        <strong>{{ negotiatedBuffer ?? '—' }}</strong>
+        <span class="metric-unit">{{ negotiatedBuffer === null ? '等待握手' : negotiatedDuration }}</span>
+      </div>
+    </section>
+
+    <p v-if="warning" class="notice warning" role="alert">{{ warning }}</p>
+    <p v-if="status === 'error'" class="notice error">请检查服务端日志、代理配置及浏览器权限后重试。</p>
+    <footer class="footer-note">当前协议：Opus / 48 kHz / 双声道 · 压缩：{{ compressionLabel }}</footer>
   </main>
 </template>

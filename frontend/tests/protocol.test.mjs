@@ -5,9 +5,11 @@ import {
   PocketType,
   decodeClose,
   decodeHandshake,
+  decodePocketWithCompression,
   decodeOpusFrames,
   decodePocket,
   encodeBuffer,
+  encodeBufferWithCompression,
   encodeClose,
   encodeHandshake,
   isNewerSequence,
@@ -31,7 +33,15 @@ test('sends buffer and close pockets with BSON payloads', () => {
 test('decodes handshake and close response fields', () => {
   assert.equal(decodeHandshake(serialize({ c: 'none', tb: 40 })), 40)
   assert.equal(decodeClose(serialize({ r: 'closing' })), 'closing')
-  assert.throws(() => decodeHandshake(serialize({ c: 'gzip', tb: 40 })), /不支持/)
+  assert.equal(decodeHandshake(serialize({ c: 'gzip:-1', tb: 40 })), 40)
+  assert.throws(() => decodeHandshake(serialize({ c: 'brotli', tb: 40 })), /不支持/)
+})
+
+test('compresses and decompresses gzip pockets', async () => {
+  const packet = await encodeBufferWithCompression(120, 65535, 'gzip')
+  const decoded = await decodePocketWithCompression(packet.buffer, 'gzip')
+  assert.equal(decoded.type, PocketType.Buffer)
+  assert.deepEqual(deserialize(decoded.payload), { cb: 120, cs: 65535 })
 })
 
 test('rejects truncated and compressed pockets', () => {

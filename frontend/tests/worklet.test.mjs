@@ -38,22 +38,30 @@ function render(player) {
 
 test('prefills before playing and fades around an underrun', () => {
   const player = createPlayer()
-  feed(player, 7)
+  feed(player, 15)
   assert.equal(render(player).every((sample) => sample === 0), true)
   feed(player, 1)
 
   const start = render(player)
-  assert.equal(start[0], 0.5 / 64)
-  assert.equal(start[63], 0.5)
-  for (let index = 0; index < 6; index++) render(player)
+  assert.equal(start[0] > 0, true)
+  assert.equal(start[0] < 0.01, true)
+  assert.equal(start[127] < 0.5, true)
+  for (let index = 0; index < 14; index++) render(player)
   const end = render(player)
-  assert.equal(end[63], 0.5)
-  assert.equal(end[64], 0.5 * 63 / 64)
-  assert.equal(end[127], 0)
+  assert.equal(end[0], 0.5 * 255 / 256)
+  assert.equal(end[63], 0.5 * 192 / 256)
+  assert.equal(end[127], 0.5 * 128 / 256)
   assert.equal(player.underruns, 1)
 
   feed(player, 8)
-  assert.equal(render(player)[0], 0.5 / 64)
+  const fadeOut = render(player)
+  assert.equal(fadeOut[0] > 0, true)
+  assert.equal(fadeOut[127], 0)
+  assert.equal(render(player).every((sample) => sample === 0), true)
+  feed(player, 8)
+  const resumed = render(player)
+  assert.equal(resumed[0] > 0, true)
+  assert.equal(resumed[0] < 0.01, true)
 })
 
 test('counts dropped packets when the queue overflows', () => {
