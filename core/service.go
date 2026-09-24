@@ -63,6 +63,7 @@ const OPUS_BITRATE = 96000 // 96kbps
 const WS_MAX_SINGLE_BYTE_LENGTH_OPUS_DURATION_RATE = 3
 const WS_MAX_BYTES = 1024
 const WS_HANDSHAKE_TIMEOUT = time.Second * 5
+const WS_WRITE_DEADLINE = time.Millisecond // not includes network
 
 type OpusFrame struct {
 	seq  uint16
@@ -80,7 +81,7 @@ func (this *OpusFrame) Seq() uint16 {
 type ServiceLatency struct {
 	Opus        atomic.Int64
 	AudioBuffer atomic.Int64
-	LastSend    atomic.Int64
+	WsSend      atomic.Int64
 }
 
 type Service struct {
@@ -322,6 +323,7 @@ func (this *Service) ws_send_pocket(ctx *ctx.ClientContext, pkt pocket.Pocket) e
 		return err
 	}
 
+	ctx.Conn.SetWriteDeadline(time.Now().Add(WS_WRITE_DEADLINE))
 	return ctx.Conn.WriteMessage(websocket.BinaryMessage, data)
 }
 
@@ -349,6 +351,7 @@ func (this *Service) ws_build_opus(ctx *ctx.ClientContext, frames []*OpusFrame) 
 }
 
 func (this *Service) ws_send_opus(ctx *ctx.ClientContext, frames []*OpusFrame) error {
+	// TODO ignore empty opus frame
 	frames_length := len(frames)
 	if frames_length == 0 {
 		return nil
@@ -359,7 +362,7 @@ func (this *Service) ws_send_opus(ctx *ctx.ClientContext, frames []*OpusFrame) e
 	if err != nil {
 		return err
 	}
-	this.latency.LastSend.Store(int64(time.Since(start)))
+	this.latency.WsSend.Store(int64(time.Since(start)))
 
 	ctx.CurrentSeq = frames[len(frames)-1].seq
 	ctx.CurrentBuffer += uint16(frames_length)
@@ -529,19 +532,22 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 			frames, full_range = this.audio_buffer.Last(client_ctx.TargetBuffer)
 			client_ctx.State = ctx.CLIENT_STATE_STABLE
 			if !full_range {
-				client_logger.Warnf("cannot get all last %d opus frames whiling sending POCKET_S_OPUS", client_ctx.TargetBuffer)
+				client_logger.Warnf("cannot get enough last opus frames whiling sending POCKET_S_OPUS: %d < %d", len(frames), client_ctx.TargetBuffer)
 			}
 			client_logger = this.logger.With(zap.Object("client", client_ctx))
 			client_ctx.Logger = client_logger
 		case ctx.CLIENT_STATE_STABLE:
 			frames, full_range = this.audio_buffer.GetGreater(client_ctx.CurrentSeq)
 			if !full_range {
-				client_logger.Warnf("cannot get all seq >= %d opus frames (count: %d) whiling sending POCKET_S_OPUS", client_ctx.CurrentSeq, len(frames))
+				client_logger.Warnf("cannot get enough seq >= %d opus frames whiling sending POCKET_S_OPUS", client_ctx.CurrentSeq, len(frames))
 			}
 		default:
 			client_logger.Warnf("invalid client state whiling sending POCKET_S_OPUS: %d", client_ctx.State)
 			continue
 		}
+
+		// TODO calc sending rate from `TargetBuffer` and client report
+		// TODO report latencies to client
 
 		err := this.ws_send_opus(client_ctx, frames)
 		if err != nil {
@@ -550,8 +556,8 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 
 		// Opus        atomic.Int64
 		// AudioBuffer atomic.Int64
-		// LastSend    atomic.Int64
-		this.logger.Debugf("latency: Opus: %v, AudioBuffer: %v, LastSend: %v", this.latency.Opus.Load(), this.latency.AudioBuffer.Load(), this.latency.LastSend.Load())
+		// WsSend    atomic.Int64
+		this.logger.Debugf("latency: Opus: %v, AudioBuffer: %v, WsSend: %v", this.latency.Opus.Load(), this.latency.AudioBuffer.Load(), this.latency.WsSend.Load())
 	}
 }
 
