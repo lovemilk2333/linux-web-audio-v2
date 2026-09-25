@@ -37,6 +37,9 @@ func check_args() error {
 
 func main() {
 	defer logger.Sync()
+	if os.Getenv("GIN_MODE") == "" {
+		gin.SetMode(gin.ReleaseMode)
+	}
 
 	arg.MustParse(&args)
 	err := check_args()
