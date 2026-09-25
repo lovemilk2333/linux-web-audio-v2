@@ -1,6 +1,6 @@
 const DEFAULT_MAX_BUFFERED_SAMPLES = 24000; // 500 ms at 48 kHz
 const FADE_SAMPLES = 256;
-const SAMPLES_PER_FRAME = 120;
+const SAMPLES_PER_FRAME = 480;
 
 class PCMPlayerProcessor extends AudioWorkletProcessor {
   constructor() {

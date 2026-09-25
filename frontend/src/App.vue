@@ -36,17 +36,18 @@ const clientDecompressionLatencyMs = ref<number | null>(null)
 const serverCompressionLatencyMs = ref<number | null>(null)
 const serverDecompressionLatencyMs = ref<number | null>(null)
 const audioOutputLatencyMs = ref(0)
-const bufferRate = ref(15)
+const bufferRate = ref(4)
 const gainDb = ref(0)
 const selectedCompression = ref<Compression>('zstd:1')
 const streamAddress = ref('')
 const negotiatedBuffer = ref<number | null>(null)
 const sessionActive = ref(false)
+const FRAME_DURATION_MS = 10
 
-const bufferDuration = computed(() => `${(bufferRate.value * 2.5).toFixed(1)} ms`)
-const negotiatedDuration = computed(() => negotiatedBuffer.value === null ? '—' : `${(negotiatedBuffer.value * 2.5).toFixed(1)} ms`)
-const currentBufferDuration = computed(() => `${(bufferedFrames.value * 2.5).toFixed(1)} ms`)
-const playbackLatencyMs = computed(() => bufferedFrames.value * 2.5 + audioOutputLatencyMs.value)
+const bufferDuration = computed(() => `${(bufferRate.value * FRAME_DURATION_MS).toFixed(1)} ms`)
+const negotiatedDuration = computed(() => negotiatedBuffer.value === null ? '—' : `${(negotiatedBuffer.value * FRAME_DURATION_MS).toFixed(1)} ms`)
+const currentBufferDuration = computed(() => `${(bufferedFrames.value * FRAME_DURATION_MS).toFixed(1)} ms`)
+const playbackLatencyMs = computed(() => bufferedFrames.value * FRAME_DURATION_MS + audioOutputLatencyMs.value)
 const bufferWatermarkLabel = computed(() => {
   if (negotiatedBuffer.value === null) return '等待握手协商'
   const watermarks = getBufferWatermarks(negotiatedBuffer.value)
@@ -93,7 +94,7 @@ type Session = {
 let active: Session | null = null
 let sharedContext: AudioContext | null = null
 const workletModulePromises = new WeakMap<AudioContext, Promise<void>>()
-const MAX_PLC_FRAMES = 8
+const MAX_PLC_FRAMES = 2
 const BUFFER_REPORT_INTERVAL_MS = 100
 const debugEnabled = (() => {
   try {
@@ -205,13 +206,13 @@ function handleAudio(session: Session, payload: Uint8Array) {
 
   const arrivalAt = performance.now()
   if (session.lastPacketArrivalAt !== null) {
-    const expectedInterval = frames.length * 2.5
+    const expectedInterval = frames.length * FRAME_DURATION_MS
     const arrivalInterval = arrivalAt - session.lastPacketArrivalAt
     const deviation = Math.abs(arrivalInterval - expectedInterval)
     session.jitterMs += (deviation - session.jitterMs) / 16
   }
   session.lastPacketArrivalAt = arrivalAt
-  const jitterFrames = Math.ceil(session.jitterMs / 2.5)
+  const jitterFrames = Math.ceil(session.jitterMs / FRAME_DURATION_MS)
   const adaptiveTargetFrames = Math.min(
     session.upperTargetFrames,
     session.baseTargetFrames + jitterFrames,
@@ -290,7 +291,7 @@ function handleAudio(session: Session, payload: Uint8Array) {
     const concealedFrames = Math.min(missingFrames, MAX_PLC_FRAMES)
     for (let missing = 0; missing < concealedFrames; missing++) {
       const decodeStart = performance.now()
-      const concealed = session.decoder.decodePacketLossFloat(120)
+      const concealed = session.decoder.decodePacketLossFloat(480)
       updateDecodeLatency(performance.now() - decodeStart)
       const concealedSequence = (previousSequence! + missing + 1) & 0xffff
       appendPending(concealed, concealedSequence)
@@ -748,7 +749,7 @@ onUnmounted(() => {
         </div>
         <div class="duration-readout">
           <span>约 {{ bufferDuration }}</span>
-          <span class="muted">每帧 2.5 ms</span>
+          <span class="muted">每帧 10 ms</span>
         </div>
         <p class="field-note watermark-note">{{ bufferWatermarkLabel }}</p>
         <input

@@ -55,7 +55,7 @@ type Handshake struct {
 	PocketBase `bson:"-"`
 	// like `zstd:3`, `gzip`
 	Compression string `bson:"c"`
-	// rate of `FRAME_DURATION`: 1 -> 2.5ms, 2 -> 5ms
+	// rate of `FRAME_DURATION`: 1 -> 10ms, 2 -> 20ms
 	TargetBuffer uint16 `bson:"tb"`
 }
 

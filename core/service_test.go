@@ -16,7 +16,7 @@ func TestOpusFrameDuration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := sizer.PCMFrameLength(), uint(240); got != want {
+	if got, want := sizer.PCMFrameLength(), uint(960); got != want {
 		t.Fatalf("PCM frame has %d float32 samples, want %d", got, want)
 	}
 

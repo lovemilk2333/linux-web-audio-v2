@@ -25,8 +25,8 @@ var upgrader = &websocket.Upgrader{
 	},
 }
 
-const OPUS_FRAME_DURATION = time.Microsecond * 2500 // 2.5ms
-const OPUS_DURATION_BASE = 400                      // 1/400s = 2.5ms
+const OPUS_FRAME_DURATION = time.Millisecond * 10 // 10ms
+const OPUS_DURATION_BASE = 100                    // 1/100s = 10ms
 const AUDIO_CAPTURE_LATENCY = 20 * time.Millisecond
 const LATENCY_REPORT_INTERVAL = 250 * time.Millisecond
 
@@ -51,7 +51,7 @@ func buffer_watermarks(target uint16) (uint16, uint16) {
 type OpusSizer struct {
 	Sample   uint
 	Channels uint
-	// duration = 2.5ms * `DurationRate`
+	// duration = 10ms * `DurationRate`
 	DurationRate uint
 	Bitrate      uint
 }
@@ -77,7 +77,7 @@ func NewOpusSizer(sample uint, channels uint, bitrate uint, duration_rate uint) 
 
 const SAMPLE_RATE = 48000
 const CHANNELS = 2
-const DURATION_RATE = 1    // 1 * 2.5ms
+const DURATION_RATE = 1    // 1 * 10ms
 const OPUS_BITRATE = 96000 // 96kbps
 
 const WS_MAX_SINGLE_BYTE_LENGTH_OPUS_DURATION_RATE = 3
@@ -165,7 +165,7 @@ func (this *Service) Init() error {
 
 	this.pcm_buffer = make([]float32, 0, this.pcm_frame_length*8)
 	this.opus_buffer = make([]byte, 1024)
-	// 1000ms = 2.5ms * 400
+	// 1000ms = 10ms * 100
 
 	this.audio_buffer = NewRingBuffer[uint16, *OpusFrame](uint16(this.buffer_rate))
 	audio_lock := this.audio_buffer.GetLock()

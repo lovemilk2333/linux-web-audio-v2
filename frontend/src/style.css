@@ -20,7 +20,7 @@ button:disabled, select:disabled, input:disabled { cursor: not-allowed; }
 .eyebrow { margin: 0 0 6px; color: #7090b7; font: 500 10px/1.2 var(--font-mono); letter-spacing: .18em; }
 h1, h2, h3, p { margin-top: 0; }
 h1 { margin-bottom: 0; font-size: 20px; letter-spacing: -.03em; }
-h2 { max-width: 530px; margin-bottom: 14px; font-size: clamp(28px, 4vw, 46px); line-height: 1.08; letter-spacing: -.055em; }
+h2 { max-width: 530px; margin-bottom: 14px; font-size: clamp(18px, 4vw, 46px); line-height: 1.08; letter-spacing: -.055em; white-space: nowrap; }
 h3 { margin-bottom: 0; font-size: 18px; letter-spacing: -.025em; }
 .status-chip { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border: 1px solid #263b58; border-radius: 999px; color: #a7b9d2; background: #0d1a2c; font-size: 12px; font-weight: 700; }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #70829b; box-shadow: 0 0 0 4px #70829b1a; }

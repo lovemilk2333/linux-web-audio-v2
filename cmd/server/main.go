@@ -22,8 +22,8 @@ var logger = zap.Must(zap.NewProduction()).Sugar()
 var args struct {
 	BasePath string `arg:"-b,--base" help:"base url path which starts with '/'" default:"/backend/v2/"`
 	Listen   string `arg:"-l,--listen" help:"listen at" default:":8643"`
-	// 2.5ms * 400 = 1s
-	BufferRate     uint `arg:"--buffer-rate,--buf" help:"opus buffer rate, which means duration = 2.5ms * this" default:"400"`
+	// 10ms * 100 = 1s
+	BufferRate     uint `arg:"--buffer-rate,--buf" help:"opus buffer rate, which means duration = 10ms * this" default:"400"`
 	AudioThreshold uint `arg:"--audio-threshold,--threshold" help:"minimum audio frames before sending a packet" default:"4"`
 }
 

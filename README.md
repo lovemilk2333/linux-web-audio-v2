@@ -92,7 +92,7 @@ go run ./cmd/server \
   --audio-threshold 4
 ```
 
-`buffer-rate` 的单位是 2.5 ms/帧；`audio-threshold` 表示服务端发送音频 pocket
+`buffer-rate` 的单位是 10 ms/帧；`audio-threshold` 表示服务端发送音频 pocket
 前至少需要的 Opus 帧数。没有足够音频数据时不会发送空 pocket。
 
 ## 部署
@@ -146,7 +146,7 @@ sudo systemctl reload caddy
 
 ## 音频与压缩
 
-协议使用 48 kHz、双声道、每帧 2.5 ms 的 Opus 音频。前端支持：
+协议使用 48 kHz、双声道、每帧 10 ms 的 Opus 音频。前端支持：
 
 - `none`
 - `gzip`

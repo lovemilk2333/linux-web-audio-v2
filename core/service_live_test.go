@@ -101,5 +101,5 @@ func TestLiveAudioStream(t *testing.T) {
 			payload = payload[3+length:]
 		}
 	}
-	t.Logf("decoded %d consecutive 2.5 ms Opus frames from the live sink monitor (peak amplitude %.3f)", count, peak)
+	t.Logf("decoded %d consecutive 10 ms Opus frames from the live sink monitor (peak amplitude %.3f)", count, peak)
 }
