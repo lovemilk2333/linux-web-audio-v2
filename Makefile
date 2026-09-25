@@ -1,0 +1,44 @@
+SHELL := /bin/sh
+
+GO ?= go
+PNPM ?= pnpm
+
+BUILD_DIR ?= build
+BIN_DIR := $(BUILD_DIR)/bin
+WEB_DIR := $(BUILD_DIR)/web
+FRONTEND_DIR := frontend
+FRONTEND_BASE ?= ./
+
+GOOS ?= linux
+GOARCH ?= amd64
+CGO_ENABLED ?= 1
+GO_RELEASE_FLAGS := -trimpath -ldflags="-s -w"
+
+.PHONY: all release go-release frontend-release test clean
+
+all: release
+
+release: go-release frontend-release
+
+go-release: $(BIN_DIR)/webaudiod
+	@rm -f $(BIN_DIR)/webaudio-client
+
+$(BIN_DIR)/webaudiod: $(shell find cmd core -type f -name '*.go') go.mod go.sum
+	@mkdir -p $(BIN_DIR)
+	CGO_ENABLED=$(CGO_ENABLED) GOOS=$(GOOS) GOARCH=$(GOARCH) \
+		$(GO) build $(GO_RELEASE_FLAGS) -o $@ ./cmd/server
+
+frontend-release:
+	$(PNPM) --dir $(FRONTEND_DIR) install --frozen-lockfile
+	VITE_BASE_PATH=$(FRONTEND_BASE) $(PNPM) --dir $(FRONTEND_DIR) run build
+	@rm -rf $(WEB_DIR)
+	@mkdir -p $(WEB_DIR)
+	@cp -a $(FRONTEND_DIR)/dist/. $(WEB_DIR)/
+
+test:
+	$(GO) test ./...
+	$(PNPM) --dir $(FRONTEND_DIR) exec node tests/worklet.test.mjs
+	$(PNPM) --dir $(FRONTEND_DIR) exec node tests/protocol.test.mjs
+
+clean:
+	rm -rf $(BUILD_DIR)
