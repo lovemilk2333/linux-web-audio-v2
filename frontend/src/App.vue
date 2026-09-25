@@ -23,6 +23,8 @@ const warning = ref('')
 const receivedFrames = ref(0)
 const receivedPackets = ref(0)
 const sentPackets = ref(0)
+const receivedPacketsPerSecond = ref(0)
+const sentPacketsPerSecond = ref(0)
 const underruns = ref(0)
 const droppedPackets = ref(0)
 const resyncDroppedPackets = ref(0)
@@ -93,6 +95,9 @@ type Session = {
 
 let active: Session | null = null
 let sharedContext: AudioContext | null = null
+let packetRateTimer: ReturnType<typeof setInterval> | null = null
+const receivedPacketTimes: number[] = []
+const sentPacketTimes: number[] = []
 const workletModulePromises = new WeakMap<AudioContext, Promise<void>>()
 const MAX_PLC_FRAMES = 2
 const BUFFER_REPORT_INTERVAL_MS = 100
@@ -110,6 +115,39 @@ function debugLog(event: string, details?: unknown) {
   const prefix = `[audio-debug ${performance.now().toFixed(1)}ms] ${event}`
   if (details === undefined) console.debug(prefix)
   else console.debug(prefix, details)
+}
+
+function updatePacketRates(now = performance.now()) {
+  const cutoff = now - 1000
+  while (receivedPacketTimes.length > 0 && receivedPacketTimes[0] <= cutoff) receivedPacketTimes.shift()
+  while (sentPacketTimes.length > 0 && sentPacketTimes[0] <= cutoff) sentPacketTimes.shift()
+  receivedPacketsPerSecond.value = receivedPacketTimes.length
+  sentPacketsPerSecond.value = sentPacketTimes.length
+}
+
+function resetPacketRates() {
+  receivedPacketTimes.length = 0
+  sentPacketTimes.length = 0
+  receivedPacketsPerSecond.value = 0
+  sentPacketsPerSecond.value = 0
+  if (packetRateTimer !== null) clearInterval(packetRateTimer)
+  packetRateTimer = setInterval(updatePacketRates, 250)
+}
+
+function stopPacketRateMonitor() {
+  if (packetRateTimer !== null) clearInterval(packetRateTimer)
+  packetRateTimer = null
+  receivedPacketTimes.length = 0
+  sentPacketTimes.length = 0
+  receivedPacketsPerSecond.value = 0
+  sentPacketsPerSecond.value = 0
+}
+
+function recordPacket(direction: 'received' | 'sent') {
+  const now = performance.now()
+  if (direction === 'received') receivedPacketTimes.push(now)
+  else sentPacketTimes.push(now)
+  updatePacketRates(now)
 }
 
 function getStreamUrl() {
@@ -153,6 +191,7 @@ function closeSession(session: Session) {
     active = null
     sessionActive.value = false
     playing.value = false
+    stopPacketRateMonitor()
   }
   if (session.timeout !== null) clearTimeout(session.timeout)
   session.timeout = null
@@ -327,6 +366,7 @@ function sendPacket(session: Session, data: Uint8Array) {
   packet.set(data)
   session.socket.send(packet.buffer)
   sentPackets.value++
+  recordPacket('sent')
   if (sentPackets.value <= 3 || sentPackets.value % 25 === 0) {
     debugLog('ws-send', { count: sentPackets.value, bytes: packet.byteLength })
   }
@@ -421,6 +461,7 @@ async function start() {
   receivedFrames.value = 0
   receivedPackets.value = 0
   sentPackets.value = 0
+  resetPacketRates()
   underruns.value = 0
   droppedPackets.value = 0
   resyncDroppedPackets.value = 0
@@ -557,7 +598,7 @@ async function start() {
           session,
           event.data.bufferedFrames,
           event.data.sequence,
-          event.data.lowWatermark || event.data.criticalWatermark || event.data.resync || event.data.highWatermark,
+          resync,
           resync,
         )
       }
@@ -589,6 +630,7 @@ async function start() {
     }
     socket.onmessage = (event: MessageEvent) => {
       receivedPackets.value++
+      recordPacket('received')
       if (receivedPackets.value <= 3 || receivedPackets.value % 25 === 0) {
         debugLog('ws-receive', { count: receivedPackets.value, bytes: event.data?.byteLength ?? null })
       }
@@ -861,12 +903,12 @@ onUnmounted(() => {
       <div class="metric-card accent-blue">
         <span class="metric-label">WebSocket 收包</span>
         <strong>{{ receivedPackets.toLocaleString() }}</strong>
-        <span class="metric-unit">packets</span>
+        <span class="metric-unit">packets · {{ receivedPacketsPerSecond.toLocaleString() }}/s</span>
       </div>
       <div class="metric-card accent-orange">
         <span class="metric-label">WebSocket 发包</span>
         <strong>{{ sentPackets.toLocaleString() }}</strong>
-        <span class="metric-unit">packets</span>
+        <span class="metric-unit">packets · {{ sentPacketsPerSecond.toLocaleString() }}/s</span>
       </div>
     </section>
 

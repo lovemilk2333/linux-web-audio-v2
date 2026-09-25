@@ -632,8 +632,10 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 						client_ctx.CurrentSeq = typed_pkt.CurrentSeq
 					}
 					last_buffer_update = time.Now()
-					if client_ctx.State == ctx.CLIENT_STATE_STABLE && (typed_pkt.Resync || client_ctx.CurrentBuffer <= refill_watermark) {
-						next_send_at = last_buffer_update
+					if client_ctx.State == ctx.CLIENT_STATE_STABLE {
+						if typed_pkt.Resync || (client_ctx.CurrentBuffer <= refill_watermark && !time.Now().Before(next_send_at)) {
+							next_send_at = last_buffer_update
+						}
 					}
 				}
 			default:
