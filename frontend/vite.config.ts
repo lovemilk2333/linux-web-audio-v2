@@ -6,7 +6,7 @@ export default defineConfig(({ command }) => ({
   base: command === 'build' ? process.env.VITE_BASE_PATH || './' : '/',
   plugins: [vue()],
   build: {
-    target: 'chrome96',
+    target: 'es2022',
     sourcemap: false,
   },
   server: {
