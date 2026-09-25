@@ -597,13 +597,14 @@ async function start() {
       lastWorkletUnderruns = event.data.underruns
       lastWorkletDroppedPackets = event.data.droppedPackets
       lastWorkletResyncDroppedPackets = event.data.resyncDroppedPackets
-      if ((event.data.lowWatermark || event.data.criticalWatermark || event.data.highWatermark || event.data.resync) && event.data.sequence !== null) {
+      if (event.data.sequence !== null) {
         const resync = event.data.criticalWatermark || event.data.resync
+        const urgent = event.data.lowWatermark || event.data.criticalWatermark || event.data.highWatermark || event.data.resync
         queueBufferReport(
           session,
           event.data.bufferedFrames,
           event.data.sequence,
-          resync,
+          urgent,
           resync,
         )
       }

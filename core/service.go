@@ -84,6 +84,7 @@ const WS_MAX_SINGLE_BYTE_LENGTH_OPUS_DURATION_RATE = 3
 const WS_MAX_BYTES = 1024
 const WS_HANDSHAKE_TIMEOUT = time.Second * 5
 const WS_WRITE_DEADLINE = 5 * time.Second
+const WS_CLOSE_DEADLINE = time.Second
 
 func isNewerSequence(sequence uint16, previous uint16) bool {
 	delta := sequence - previous
@@ -376,6 +377,9 @@ func (this *Service) ws_send_pocket(ctx *ctx.ClientContext, pkt pocket.Pocket) e
 	if pkt.GetType() == pocket.POCKET_S_OPUS {
 		this.latency.WsSend.Store(int64(time.Since(start)))
 	}
+	if err != nil {
+		return fmt.Errorf("write pocket type %d (%d bytes, %s): %w", pkt.GetType(), len(data), time.Since(start), err)
+	}
 	return err
 }
 
@@ -437,13 +441,14 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 			return
 		}
 
-		this.ws_send_pocket(
-			client_ctx, &pocket.Close{
-				Type:   pocket.POCKET_CLOSE,
-				Ctx:    client_ctx,
-				Reason: close_reason,
-				Source: "server2client",
-			},
+		client_logger.Warnw("closing WebSocket", "reason", close_reason, "state", client_ctx.State)
+		if len(close_reason) > 120 {
+			close_reason = close_reason[:120]
+		}
+		_ = conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, close_reason),
+			time.Now().Add(WS_CLOSE_DEADLINE),
 		)
 	}()
 
@@ -507,6 +512,14 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 	close_reason = ""
 	recv := make(chan pocket.Pocket, 16)
 	wake := make(chan struct{}, 1)
+	enqueue := func(pkt pocket.Pocket) bool {
+		select {
+		case recv <- pkt:
+			return true
+		case <-go_ctx.Done():
+			return false
+		}
+	}
 	notify := func() {
 		select {
 		case wake <- struct{}{}:
@@ -524,13 +537,14 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 				_, data, err := conn.ReadMessage()
 				if err != nil {
 					client_logger.Infow("cannot read message: client may close the connection", "error", err)
-					recv <- &pocket.Close{
+					if enqueue(&pocket.Close{
 						Type:   pocket.POCKET_CLOSE,
 						Ctx:    client_ctx,
 						Reason: err.Error(),
 						Source: "server-internal",
+					}) {
+						notify()
 					}
-					notify()
 					return
 				}
 
@@ -540,7 +554,9 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 					break
 				}
 
-				recv <- pkt
+				if !enqueue(pkt) {
+					return
+				}
 				notify()
 			}
 		}
@@ -615,6 +631,7 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 					})
 					if err != nil {
 						client_logger.Warnw("cannot send re-config handshake response", "error", err)
+						close_reason = fmt.Sprintf("re-config handshake response failed: %v", err)
 						return
 					}
 					client_logger.Infow("client re-config handshake", "compression", client_ctx.Compressor.Ident(), "target-buffer", client_ctx.TargetBuffer)
@@ -681,6 +698,7 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 			})
 			if err != nil {
 				client_logger.Warnw("cannot send latency pocket", "error", err)
+				close_reason = fmt.Sprintf("latency packet send failed: %v", err)
 				return
 			}
 			next_latency_report = time.Now().Add(LATENCY_REPORT_INTERVAL)
@@ -712,6 +730,7 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 			if initial_packet != nil {
 				if err := this.ws_send_prepared_opus(client_ctx, initial_packet, initial_last_seq, int(initial_frame_count)); err != nil {
 					client_logger.Warnw("cannot send initial opus frames", "error", err)
+					close_reason = fmt.Sprintf("initial audio packet send failed: %v", err)
 					return
 				}
 				client_ctx.State = ctx.CLIENT_STATE_STABLE
@@ -775,6 +794,7 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 				}
 				if err := this.ws_send_prepared_opus(client_ctx, packet, last_seq, send_size); err != nil {
 					client_logger.Warnw("cannot send opus frames", "error", err)
+					close_reason = fmt.Sprintf("audio packet send failed: %v", err)
 					return
 				}
 				last_send_at = time.Now()
