@@ -27,6 +27,7 @@ var upgrader = &websocket.Upgrader{
 
 const OPUS_FRAME_DURATION = time.Microsecond * 2500 // 2.5ms
 const OPUS_DURATION_BASE = 400                      // 1/400s = 2.5ms
+const AUDIO_CAPTURE_LATENCY = 20 * time.Millisecond
 const LATENCY_REPORT_INTERVAL = 250 * time.Millisecond
 
 func buffer_watermarks(target uint16) (uint16, uint16) {
@@ -162,7 +163,7 @@ func (this *Service) Init() error {
 
 	this.pcm_frame_length = this.sizer.PCMFrameLength()
 
-	this.pcm_buffer = make([]float32, 0, this.pcm_frame_length*2)
+	this.pcm_buffer = make([]float32, 0, this.pcm_frame_length*8)
 	this.opus_buffer = make([]byte, 1024)
 	// 1000ms = 2.5ms * 400
 
@@ -223,7 +224,7 @@ func (this *Service) Init() error {
 		callback,
 		pulse.RecordSampleRate(SAMPLE_RATE),
 		pulse.RecordStereo,
-		pulse.RecordLatency(float64(DURATION_RATE)/OPUS_DURATION_BASE),
+		pulse.RecordLatency(AUDIO_CAPTURE_LATENCY.Seconds()),
 		pulse.RecordMonitor(sink),
 	)
 	if err != nil {

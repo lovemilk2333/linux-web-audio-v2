@@ -47,8 +47,8 @@ async function loadWasmCompressor(): Promise<WasmCompressor> {
         return
       }
       const go = new global.Go()
-      void WebAssembly.instantiateStreaming(fetch('/compressor.wasm'), go.importObject)
-        .catch(async () => WebAssembly.instantiate(await (await fetch('/compressor.wasm')).arrayBuffer(), go.importObject))
+      void WebAssembly.instantiateStreaming(fetch('./compressor.wasm'), go.importObject)
+        .catch(async () => WebAssembly.instantiate(await (await fetch('./compressor.wasm')).arrayBuffer(), go.importObject))
         .then(({ instance }) => {
           void go.run(instance)
           const waitForGlobal = () => global.linuxWebAudioCompress ? finish() : setTimeout(waitForGlobal, 0)
@@ -61,7 +61,7 @@ async function loadWasmCompressor(): Promise<WasmCompressor> {
       return
     }
     const script = document.createElement('script')
-    script.src = '/wasm_exec.js'
+    script.src = './wasm_exec.js'
     script.onload = start
     script.onerror = () => reject(new Error('无法加载 Go WASM 运行时'))
     document.head.appendChild(script)
