@@ -21,14 +21,16 @@ const (
 )
 
 type ClientContext struct {
-	Conn          *websocket.Conn
-	Addr          net.Addr
-	State         ClientState
-	TargetBuffer  uint16
-	CurrentBuffer uint16
-	Compressor    Compressor
-	Logger        *zap.SugaredLogger
-	CurrentSeq    uint16
+	Conn           *websocket.Conn
+	Addr           net.Addr
+	State          ClientState
+	TargetBuffer   uint16
+	CurrentBuffer  uint16
+	Compressor     Compressor
+	Logger         *zap.SugaredLogger
+	CurrentSeq     uint16
+	ReportedSeq    uint16
+	HasReportedSeq bool
 }
 
 func (this *ClientContext) String() string {

@@ -87,6 +87,25 @@ func TestIsNewerSequence(t *testing.T) {
 	}
 }
 
+func TestSequenceDistance(t *testing.T) {
+	tests := []struct {
+		newer uint16
+		older uint16
+		want  uint16
+	}{
+		{newer: 11, older: 10, want: 1},
+		{newer: 0, older: ^uint16(0), want: 1},
+		{newer: 10, older: 10, want: 0},
+		{newer: 9, older: 10, want: 0},
+		{newer: ^uint16(0), older: 0, want: 0},
+	}
+	for _, test := range tests {
+		if got := sequenceDistance(test.newer, test.older); got != test.want {
+			t.Errorf("sequenceDistance(%d, %d) = %d, want %d", test.newer, test.older, got, test.want)
+		}
+	}
+}
+
 func TestContinuousOpusAudio(t *testing.T) {
 	sizer, err := NewOpusSizer(SAMPLE_RATE, CHANNELS, OPUS_BITRATE, DURATION_RATE)
 	if err != nil {

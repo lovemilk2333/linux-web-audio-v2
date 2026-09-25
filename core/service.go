@@ -90,6 +90,13 @@ func isNewerSequence(sequence uint16, previous uint16) bool {
 	return delta != 0 && delta < 1<<15
 }
 
+func sequenceDistance(newer uint16, older uint16) uint16 {
+	if !isNewerSequence(newer, older) {
+		return 0
+	}
+	return newer - older
+}
+
 type OpusFrame struct {
 	seq  uint16
 	data []byte
@@ -591,6 +598,8 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 					client_ctx.Compressor = new_compressor
 					client_ctx.CurrentBuffer = 0
 					client_ctx.CurrentSeq = 0
+					client_ctx.ReportedSeq = 0
+					client_ctx.HasReportedSeq = false
 					client_ctx.TargetBuffer = uint16(min(typed_pkt.TargetBuffer, this.audio_buffer.data_cap))
 					refill_watermark, upper_watermark = buffer_watermarks(client_ctx.TargetBuffer)
 					client_ctx.State = ctx.CLIENT_STATE_READY
@@ -615,7 +624,23 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 					conn.Close()
 					return
 				case *pocket.Buffer:
-					client_ctx.CurrentBuffer = min(typed_pkt.CurrentBuffer, upper_watermark)
+					cursor_is_new := !client_ctx.HasReportedSeq || typed_pkt.CurrentSeq == client_ctx.ReportedSeq || isNewerSequence(typed_pkt.CurrentSeq, client_ctx.ReportedSeq)
+					if !cursor_is_new {
+						client_logger.Debugw("ignoring stale client buffer report",
+							"reported_seq", typed_pkt.CurrentSeq,
+							"last_reported_seq", client_ctx.ReportedSeq,
+							"current_seq", client_ctx.CurrentSeq,
+							"resync", typed_pkt.Resync,
+						)
+						continue
+					}
+					client_ctx.ReportedSeq = typed_pkt.CurrentSeq
+					client_ctx.HasReportedSeq = true
+					in_flight_frames := sequenceDistance(client_ctx.CurrentSeq, typed_pkt.CurrentSeq)
+					client_ctx.CurrentBuffer = uint16(min(
+						uint32(upper_watermark),
+						uint32(typed_pkt.CurrentBuffer)+uint32(in_flight_frames),
+					))
 					if typed_pkt.Resync {
 						if typed_pkt.CurrentSeq == client_ctx.CurrentSeq || isNewerSequence(typed_pkt.CurrentSeq, client_ctx.CurrentSeq) {
 							client_ctx.CurrentSeq = typed_pkt.CurrentSeq
@@ -633,7 +658,7 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 					}
 					last_buffer_update = time.Now()
 					if client_ctx.State == ctx.CLIENT_STATE_STABLE {
-						if typed_pkt.Resync || (client_ctx.CurrentBuffer <= refill_watermark && !time.Now().Before(next_send_at)) {
+						if typed_pkt.Resync || client_ctx.CurrentBuffer <= refill_watermark {
 							next_send_at = last_buffer_update
 						}
 					}

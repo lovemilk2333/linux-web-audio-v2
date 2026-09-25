@@ -84,6 +84,7 @@ type Session = {
   bufferReportQueued: boolean
   pendingBufferReport: { bufferedFrames: number; sequence: number; resync: boolean; requestBuffer: number } | null
   lastBufferReportAt: number
+  lastResyncReportAt: number
   lastPacketArrivalAt: number | null
   jitterMs: number
   baseTargetFrames: number
@@ -375,6 +376,9 @@ function sendPacket(session: Session, data: Uint8Array) {
 
 function queueBufferReport(session: Session, bufferedFrames: number, sequence: number, urgent = false, resync = false) {
   if (!session.handshakeComplete || session.reconfiguring || session.socket?.readyState !== WebSocket.OPEN) return
+  const now = performance.now()
+  if (resync && urgent && now - session.lastResyncReportAt < 250) return
+  if (resync && urgent) session.lastResyncReportAt = now
   session.pendingBufferReport = {
     bufferedFrames: Math.min(bufferedFrames, 0xffff),
     sequence,
@@ -507,6 +511,7 @@ async function start() {
     bufferReportQueued: false,
     pendingBufferReport: null,
     lastBufferReportAt: 0,
+    lastResyncReportAt: 0,
     lastPacketArrivalAt: null,
     jitterMs: 0,
     baseTargetFrames: 1,
