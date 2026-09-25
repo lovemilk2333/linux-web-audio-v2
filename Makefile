@@ -12,7 +12,13 @@ FRONTEND_BASE ?= ./
 GOOS ?= linux
 GOARCH ?= amd64
 CGO_ENABLED ?= 1
+GOMAXPROCS ?= 1
+GOEXPERIMENT ?= none
+GOTOOLCHAIN ?= local
+GO_BUILD_FLAGS ?= -p=1
 GO_RELEASE_FLAGS := -trimpath -ldflags="-s -w"
+GO_BUILD_ENV := CGO_ENABLED=$(CGO_ENABLED) GOOS=$(GOOS) GOARCH=$(GOARCH) \
+	GOMAXPROCS=$(GOMAXPROCS) GOEXPERIMENT=$(GOEXPERIMENT) GOTOOLCHAIN=$(GOTOOLCHAIN)
 
 .PHONY: all release go-release frontend-release test clean
 
@@ -25,8 +31,7 @@ go-release: $(BIN_DIR)/webaudiod
 
 $(BIN_DIR)/webaudiod: $(shell find cmd core -type f -name '*.go') go.mod go.sum
 	@mkdir -p $(BIN_DIR)
-	CGO_ENABLED=$(CGO_ENABLED) GOOS=$(GOOS) GOARCH=$(GOARCH) \
-		$(GO) build $(GO_RELEASE_FLAGS) -o $@ ./cmd/server
+	$(GO_BUILD_ENV) $(GO) build $(GO_BUILD_FLAGS) $(GO_RELEASE_FLAGS) -o $@ ./cmd/server
 
 frontend-release:
 	$(PNPM) --dir $(FRONTEND_DIR) install --frozen-lockfile
@@ -36,7 +41,7 @@ frontend-release:
 	@cp -a $(FRONTEND_DIR)/dist/. $(WEB_DIR)/
 
 test:
-	$(GO) test ./...
+	$(GO_BUILD_ENV) $(GO) test $(GO_BUILD_FLAGS) ./...
 	$(PNPM) --dir $(FRONTEND_DIR) exec node tests/worklet.test.mjs
 	$(PNPM) --dir $(FRONTEND_DIR) exec node tests/protocol.test.mjs
 
