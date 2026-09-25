@@ -677,7 +677,14 @@ async function start() {
       }).catch((err: unknown) => fail(session, err))
     }
     socket.onerror = () => fail(session, new Error('WebSocket 连接错误'))
-    socket.onclose = (event) => fail(session, new Error(`连接已断开（${event.code}）`))
+    socket.onclose = (event) => {
+      debugLog('ws-close', {
+        code: event.code,
+        reason: event.reason,
+        wasClean: event.wasClean,
+      })
+      fail(session, new Error(`连接已断开（${event.code}${event.reason ? `：${event.reason}` : ''}）`))
+    }
   } catch (err) {
     fail(session, err)
   }

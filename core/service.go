@@ -83,7 +83,7 @@ const OPUS_BITRATE = 96000 // 96kbps
 const WS_MAX_SINGLE_BYTE_LENGTH_OPUS_DURATION_RATE = 3
 const WS_MAX_BYTES = 1024
 const WS_HANDSHAKE_TIMEOUT = time.Second * 5
-const WS_WRITE_DEADLINE = time.Millisecond // not includes network
+const WS_WRITE_DEADLINE = 5 * time.Second
 
 func isNewerSequence(sequence uint16, previous uint16) bool {
 	delta := sequence - previous
@@ -361,7 +361,9 @@ func (this *Service) ws_send_pocket(ctx *ctx.ClientContext, pkt pocket.Pocket) e
 		return err
 	}
 
-	ctx.Conn.SetWriteDeadline(time.Now().Add(WS_WRITE_DEADLINE))
+	if err := ctx.Conn.SetWriteDeadline(time.Now().Add(WS_WRITE_DEADLINE)); err != nil {
+		return fmt.Errorf("set WebSocket write deadline: %w", err)
+	}
 	start := time.Now()
 	err = ctx.Conn.WriteMessage(websocket.BinaryMessage, data)
 	if pkt.GetType() == pocket.POCKET_S_OPUS {
