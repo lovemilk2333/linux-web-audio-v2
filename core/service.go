@@ -617,7 +617,9 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 				case *pocket.Buffer:
 					client_ctx.CurrentBuffer = min(typed_pkt.CurrentBuffer, upper_watermark)
 					if typed_pkt.Resync {
-						client_ctx.CurrentSeq = typed_pkt.CurrentSeq
+						if typed_pkt.CurrentSeq == client_ctx.CurrentSeq || isNewerSequence(typed_pkt.CurrentSeq, client_ctx.CurrentSeq) {
+							client_ctx.CurrentSeq = typed_pkt.CurrentSeq
+						}
 						requested_buffer = typed_pkt.RequestBuffer
 						if requested_buffer == 0 {
 							requested_buffer = uint16(min(
