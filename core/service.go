@@ -395,20 +395,18 @@ func (this *Service) ws_build_opus(ctx *ctx.ClientContext, frames []*OpusFrame) 
 	return pkt
 }
 
-func (this *Service) ws_send_opus(ctx *ctx.ClientContext, frames []*OpusFrame) error {
-	// TODO ignore empty opus frame
-	frames_length := len(frames)
+func (this *Service) ws_send_prepared_opus(client_ctx *ctx.ClientContext, packet *pocket.Opus, last_seq uint16, frames_length int) error {
 	if frames_length == 0 {
 		return nil
 	}
 
-	err := this.ws_send_pocket(ctx, this.ws_build_opus(ctx, frames))
+	err := this.ws_send_pocket(client_ctx, packet)
 	if err != nil {
 		return err
 	}
 
-	ctx.CurrentSeq = frames[len(frames)-1].seq
-	ctx.CurrentBuffer += uint16(frames_length)
+	client_ctx.CurrentSeq = last_seq
+	client_ctx.CurrentBuffer += uint16(frames_length)
 
 	return nil
 }
@@ -667,26 +665,35 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 		if client_ctx.State == ctx.CLIENT_STATE_READY {
 			var enough_frames []*OpusFrame
 			initial_frame_count := min(client_ctx.TargetBuffer, uint16(this.audio_buffer.data_cap))
+			var initial_packet *pocket.Opus
+			var initial_last_seq uint16
+
+			audio_lock := this.audio_buffer.GetLock()
+			audio_lock.RLock()
 			if this.audio_threshold > 0 {
-				enough_frames, _ = this.audio_buffer.Last(uint16(min(this.audio_threshold, uint(^uint16(0)))))
+				enough_frames, _ = this.audio_buffer.getLast(uint16(min(this.audio_threshold, uint(^uint16(0)))))
 			}
 			if (this.audio_threshold == 0 || len(enough_frames) >= int(this.audio_threshold)) && initial_frame_count > 0 {
-				frames, _ := this.audio_buffer.Last(initial_frame_count)
+				frames, _ := this.audio_buffer.getLast(initial_frame_count)
 				if len(frames) >= int(initial_frame_count) {
-					if err := this.ws_send_opus(client_ctx, frames); err != nil {
-						client_logger.Warnw("cannot send initial opus frames", "error", err)
-						return
-					}
-					client_ctx.State = ctx.CLIENT_STATE_STABLE
-					last_send_at = time.Now()
-					last_buffer_update = last_send_at
-					wait_frames := max(0, int(client_ctx.CurrentBuffer)-int(refill_watermark))
-					next_send_at = last_send_at.Add(time.Duration(wait_frames) * OPUS_FRAME_DURATION)
+					initial_packet = this.ws_build_opus(client_ctx, frames)
+					initial_last_seq = frames[len(frames)-1].seq
 				}
 			}
+			audio_lock.RUnlock()
+
+			if initial_packet != nil {
+				if err := this.ws_send_prepared_opus(client_ctx, initial_packet, initial_last_seq, int(initial_frame_count)); err != nil {
+					client_logger.Warnw("cannot send initial opus frames", "error", err)
+					return
+				}
+				client_ctx.State = ctx.CLIENT_STATE_STABLE
+				last_send_at = time.Now()
+				last_buffer_update = last_send_at
+				wait_frames := max(0, int(client_ctx.CurrentBuffer)-int(refill_watermark))
+				next_send_at = last_send_at.Add(time.Duration(wait_frames) * OPUS_FRAME_DURATION)
+			}
 		} else if client_ctx.State == ctx.CLIENT_STATE_STABLE && !now.Before(next_send_at) {
-			frames, full_range := this.audio_buffer.GetGreater(client_ctx.CurrentSeq)
-			available := len(frames)
 			batch_size := int(client_ctx.TargetBuffer)
 			if requested_buffer > 0 {
 				batch_size = max(0, int(requested_buffer)-int(client_ctx.CurrentBuffer))
@@ -697,15 +704,38 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 			if this.audio_threshold > 0 {
 				minimum_send_size = min(batch_size, int(min(this.audio_threshold, uint(^uint16(0)))))
 			}
-			send_size := min(batch_size, available)
+			var packet *pocket.Opus
+			var last_seq uint16
+			var send_size int
+			var available int
+			var full_range bool
+			var oldest_seq uint16
+			var newest_seq uint16
+
+			audio_lock := this.audio_buffer.GetLock()
+			audio_lock.RLock()
+			frames, range_is_full := this.audio_buffer.getGreater(client_ctx.CurrentSeq)
+			available = len(frames)
+			full_range = range_is_full
+			if available > 0 {
+				oldest_seq = frames[0].seq
+				newest_seq = frames[len(frames)-1].seq
+			}
+			send_size = min(batch_size, available)
 			if batch_size > 0 && available >= minimum_send_size {
+				packet = this.ws_build_opus(client_ctx, frames[:send_size])
+				last_seq = frames[send_size-1].seq
+			}
+			audio_lock.RUnlock()
+
+			if packet != nil {
 				if !full_range {
-					cursor_gap := uint16(frames[0].seq - client_ctx.CurrentSeq)
+					cursor_gap := uint16(oldest_seq - client_ctx.CurrentSeq)
 					log_fields := []interface{}{
 						"client_state", client_ctx.State,
 						"current_seq", client_ctx.CurrentSeq,
-						"oldest_seq", frames[0].seq,
-						"newest_seq", frames[len(frames)-1].seq,
+						"oldest_seq", oldest_seq,
+						"newest_seq", newest_seq,
 						"available_frames", available,
 						"current_buffer", client_ctx.CurrentBuffer,
 						"skipped_frames", max(0, int(cursor_gap)-1),
@@ -716,7 +746,7 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 						client_logger.Debugw("client cursor resynced to audio ring buffer", log_fields...)
 					}
 				}
-				if err := this.ws_send_opus(client_ctx, frames[:send_size]); err != nil {
+				if err := this.ws_send_prepared_opus(client_ctx, packet, last_seq, send_size); err != nil {
 					client_logger.Warnw("cannot send opus frames", "error", err)
 					return
 				}

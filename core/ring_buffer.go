@@ -142,6 +142,11 @@ func (this *RingBuffer[S, D]) GetGreater(min_seq S) ([]D, bool) {
 	this.mu.RLock()
 	defer this.mu.RUnlock()
 
+	return this.getGreater(min_seq)
+}
+
+func (this *RingBuffer[S, D]) getGreater(min_seq S) ([]D, bool) {
+
 	if this.data_length == 0 {
 		return nil, true
 	}
@@ -172,6 +177,11 @@ func (this *RingBuffer[S, D]) First(n S) ([]D, bool) {
 func (this *RingBuffer[S, D]) Last(n S) ([]D, bool) {
 	this.mu.RLock()
 	defer this.mu.RUnlock()
+
+	return this.getLast(n)
+}
+
+func (this *RingBuffer[S, D]) getLast(n S) ([]D, bool) {
 
 	if this.data_length < n {
 		return this.data[:this.data_length], false
