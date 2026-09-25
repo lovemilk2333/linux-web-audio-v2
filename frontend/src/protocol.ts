@@ -137,8 +137,11 @@ export function encodeHandshake(targetBuffer: number, compression: Compression =
   return encodePocket(PocketType.Handshake, serialize({ c: compression, tb: targetBuffer }))
 }
 
-export function encodeBuffer(bufferedFrames: number, sequence: number): Uint8Array<ArrayBuffer> {
-  return encodePocket(PocketType.Buffer, serialize({ cb: bufferedFrames, cs: sequence }))
+export function encodeBuffer(bufferedFrames: number, sequence: number, resync = false, requestBuffer = 0): Uint8Array<ArrayBuffer> {
+  const value: { cb: number; cs: number; rs?: boolean; rb?: number } = { cb: bufferedFrames, cs: sequence }
+  if (resync) value.rs = true
+  if (requestBuffer > 0) value.rb = requestBuffer
+  return encodePocket(PocketType.Buffer, serialize(value))
 }
 
 export function encodeClose(): Uint8Array<ArrayBuffer> {
@@ -155,8 +158,11 @@ export function encodeHandshakeWithCompression(targetBuffer: number, compression
   return encodeHandshake(targetBuffer, compression)
 }
 
-export async function encodeBufferWithCompression(bufferedFrames: number, sequence: number, compression: Compression): Promise<Uint8Array<ArrayBuffer>> {
-  return encodePocketWithCompression(PocketType.Buffer, serialize({ cb: bufferedFrames, cs: sequence }), compression)
+export async function encodeBufferWithCompression(bufferedFrames: number, sequence: number, compression: Compression, resync = false, requestBuffer = 0): Promise<Uint8Array<ArrayBuffer>> {
+  const value: { cb: number; cs: number; rs?: boolean; rb?: number } = { cb: bufferedFrames, cs: sequence }
+  if (resync) value.rs = true
+  if (requestBuffer > 0) value.rb = requestBuffer
+  return encodePocketWithCompression(PocketType.Buffer, serialize(value), compression)
 }
 
 export async function encodeCloseWithCompression(compression: Compression): Promise<Uint8Array<ArrayBuffer>> {
@@ -207,17 +213,25 @@ export function decodeClose(payload: Uint8Array): string {
   return typeof response.r === 'string' ? response.r : '未提供原因'
 }
 
-export type LatencyInfo = { opus: number; audioBuffer: number; wsSend: number }
+export type LatencyInfo = {
+  opus: number
+  audioBuffer: number
+  wsSend: number
+  compression: number
+  decompression: number
+}
 
 export function decodeLatency(payload: Uint8Array): LatencyInfo {
   const response = deserialize(payload)
   const opus = response.o
   const audioBuffer = response.ab
   const wsSend = response.ws
-  if (![opus, audioBuffer, wsSend].every(value => typeof value === 'number' && Number.isFinite(value) && value >= 0)) {
+  const compression = response.c ?? 0
+  const decompression = response.d ?? 0
+  if (![opus, audioBuffer, wsSend, compression, decompression].every(value => typeof value === 'number' && Number.isFinite(value) && value >= 0)) {
     throw new Error('服务端延迟数据无效')
   }
-  return { opus, audioBuffer, wsSend }
+  return { opus, audioBuffer, wsSend, compression, decompression }
 }
 
 export type OpusFrame = { sequence: number; data: Uint8Array }

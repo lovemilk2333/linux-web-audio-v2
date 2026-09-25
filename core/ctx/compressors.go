@@ -10,7 +10,6 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
-	"go.uber.org/zap"
 )
 
 func CompressorIdent(name string, level int32) string {
@@ -189,7 +188,7 @@ func NewZstdCompressor(ctx *ClientContext, level int32) (*ZstdCompressor, error)
 				zstd.WithEncoderConcurrency(1),
 			)
 			if err != nil {
-				logger.Error("cannot create zstd writer", zap.Error(err))
+				logger.Errorw("cannot create zstd writer", "error", err)
 				return nil
 			}
 
@@ -205,7 +204,7 @@ func NewZstdCompressor(ctx *ClientContext, level int32) (*ZstdCompressor, error)
 		New: func() interface{} {
 			zr, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
 			if err != nil {
-				logger.Error("cannot create zstd reader", zap.Error(err))
+				logger.Errorw("cannot create zstd reader", "error", err)
 				return nil
 			}
 
@@ -224,6 +223,16 @@ type LZ4Compressor struct {
 	level       int32
 	writer_pool sync.Pool
 	reader_pool sync.Pool
+}
+
+func normalizeLZ4CompressionLevel(level int32) lz4.CompressionLevel {
+	if level <= 0 {
+		return lz4.Fast
+	}
+	if level > 9 {
+		level = 9
+	}
+	return lz4.CompressionLevel(uint32(1) << (8 + uint32(level)))
 }
 
 func (this *LZ4Compressor) Ident() string {
@@ -272,7 +281,7 @@ func (this *LZ4Compressor) Decompress(compressed []byte) ([]byte, error) {
 
 func NewLZ4Compressor(ctx *ClientContext, level int32) (*LZ4Compressor, error) {
 	logger := ctx.Logger
-	lz4_level := lz4.CompressionLevel(level)
+	lz4_level := normalizeLZ4CompressionLevel(level)
 
 	compressor := &LZ4Compressor{
 		level: level,
@@ -282,7 +291,7 @@ func NewLZ4Compressor(ctx *ClientContext, level int32) (*LZ4Compressor, error) {
 		New: func() interface{} {
 			zw := lz4.NewWriter(io.Discard)
 			if err := zw.Apply(lz4.CompressionLevelOption(lz4_level)); err != nil {
-				logger.Error("cannot create lz4 writer option", zap.Error(err))
+				logger.Errorw("cannot create lz4 writer option", "error", err)
 			}
 
 			runtime.SetFinalizer(zw, func(w *lz4.Writer) {

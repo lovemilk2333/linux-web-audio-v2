@@ -48,21 +48,41 @@ func TestBufferWatermarks(t *testing.T) {
 		lower  uint16
 		upper  uint16
 	}{
-		{target: 0, lower: 0, upper: 0},
-		{target: 1, lower: 1, upper: 2},
-		{target: 2, lower: 2, upper: 3},
-		{target: 3, lower: 3, upper: 5},
-		{target: 4, lower: 4, upper: 6},
-		{target: 5, lower: 5, upper: 8},
-		{target: 20, lower: 20, upper: 30},
-		{target: 21, lower: 21, upper: 31},
-		{target: 400, lower: 400, upper: 410},
-		{target: ^uint16(0), lower: ^uint16(0), upper: ^uint16(0)},
+		{target: 0, lower: 2, upper: 2},
+		{target: 1, lower: 2, upper: 3},
+		{target: 2, lower: 2, upper: 4},
+		{target: 3, lower: 1, upper: 4},
+		{target: 4, lower: 2, upper: 6},
+		{target: 5, lower: 2, upper: 7},
+		{target: 8, lower: 4, upper: 12},
+		{target: 20, lower: 10, upper: 30},
+		{target: 21, lower: 10, upper: 31},
+		{target: 400, lower: 200, upper: 600},
+		{target: ^uint16(0), lower: ^uint16(0) / 2, upper: ^uint16(0)},
 	}
 	for _, test := range tests {
 		lower, upper := buffer_watermarks(test.target)
 		if lower != test.lower || upper != test.upper {
 			t.Errorf("bufferWatermarks(%d) = (%d, %d), want (%d, %d)", test.target, lower, upper, test.lower, test.upper)
+		}
+	}
+}
+
+func TestIsNewerSequence(t *testing.T) {
+	tests := []struct {
+		sequence uint16
+		previous uint16
+		want     bool
+	}{
+		{sequence: 11, previous: 10, want: true},
+		{sequence: 0, previous: ^uint16(0), want: true},
+		{sequence: 10, previous: 10, want: false},
+		{sequence: 9, previous: 10, want: false},
+		{sequence: ^uint16(0), previous: 0, want: false},
+	}
+	for _, test := range tests {
+		if got := isNewerSequence(test.sequence, test.previous); got != test.want {
+			t.Errorf("isNewerSequence(%d, %d) = %t, want %t", test.sequence, test.previous, got, test.want)
 		}
 	}
 }

@@ -30,19 +30,21 @@ const OPUS_DURATION_BASE = 400                      // 1/400s = 2.5ms
 const LATENCY_REPORT_INTERVAL = 250 * time.Millisecond
 
 func buffer_watermarks(target uint16) (uint16, uint16) {
-	lower := target
-	extra := (uint32(target) + 1) / 2
-	if extra > 10 {
-		extra = 10
+	refill_at := uint32(target) / 2
+	if target <= 2 {
+		refill_at = 2
 	}
-	upper := uint32(target) + extra
+	if refill_at > uint32(^uint16(0)) {
+		refill_at = uint32(^uint16(0))
+	}
+	upper := uint32(target) + refill_at
 	if upper > uint32(^uint16(0)) {
 		upper = uint32(^uint16(0))
 	}
-	if upper < uint32(lower) {
-		upper = uint32(lower)
+	if upper < refill_at {
+		upper = refill_at
 	}
-	return lower, uint16(upper)
+	return uint16(refill_at), uint16(upper)
 }
 
 type OpusSizer struct {
@@ -82,6 +84,11 @@ const WS_MAX_BYTES = 1024
 const WS_HANDSHAKE_TIMEOUT = time.Second * 5
 const WS_WRITE_DEADLINE = time.Millisecond // not includes network
 
+func isNewerSequence(sequence uint16, previous uint16) bool {
+	delta := sequence - previous
+	return delta != 0 && delta < 1<<15
+}
+
 type OpusFrame struct {
 	seq  uint16
 	data []byte
@@ -96,9 +103,11 @@ func (this *OpusFrame) Seq() uint16 {
 }
 
 type ServiceLatency struct {
-	Opus        atomic.Int64
-	AudioBuffer atomic.Int64
-	WsSend      atomic.Int64
+	Opus          atomic.Int64
+	AudioBuffer   atomic.Int64
+	WsSend        atomic.Int64
+	Compression   atomic.Int64
+	Decompression atomic.Int64
 }
 
 type Service struct {
@@ -123,28 +132,28 @@ type Service struct {
 func (this *Service) Init() error {
 	client, err := pulse.NewClient()
 	if err != nil {
-		this.logger.Error("cannot create pulse client", zap.Error(err))
+		this.logger.Errorw("cannot create pulse client", "error", err)
 		return err
 	}
 
 	sink, err := client.DefaultSink()
 	if err != nil {
-		this.logger.Error("cannot get pulse default sink", zap.Error(err))
+		this.logger.Errorw("cannot get pulse default sink", "error", err)
 		return err
 	} else {
-		this.logger.Debug("got default pulse sink", zap.String("sink", sink.Name()))
+		this.logger.Debugw("got default pulse sink", "sink", sink.Name())
 	}
 
 	encoder, err := opus.NewEncoder(SAMPLE_RATE, CHANNELS, opus.AppAudio)
 	if err != nil {
-		this.logger.Error("cannot create opus encoder", zap.Error(err))
+		this.logger.Errorw("cannot create opus encoder", "error", err)
 		return err
 	}
 	this.encoder = encoder
 
 	sizer, err := NewOpusSizer(SAMPLE_RATE, CHANNELS, OPUS_BITRATE, DURATION_RATE)
 	if err != nil {
-		this.logger.Error("cannot create opus sizer", zap.Error(err))
+		this.logger.Errorw("cannot create opus sizer", "error", err)
 		return err
 	}
 
@@ -252,7 +261,9 @@ func (this *Service) ws_decode_pocket(ctx *ctx.ClientContext, data []byte) (pock
 		pocket_type_uint16 &= ^pocket.RAW_PAYLOAD_MASK
 		pocket_payload = data[:length-2]
 	} else {
+		start := time.Now()
 		pocket_payload, err = ctx.Compressor.Decompress(data[:length-2])
+		this.latency.Decompression.Store(int64(time.Since(start)))
 		if err != nil {
 			return nil, fmt.Errorf("decompress failed: %w", err)
 		}
@@ -303,6 +314,7 @@ KNOWN ISSUE: `none` compression will always be as the *uncompressed payload*
 */
 func (this *Service) ws_encode_pocket(ctx *ctx.ClientContext, pkt pocket.Pocket) ([]byte, error) {
 	var payload []byte
+	var err error
 
 	switch pkt.GetType() {
 	case pocket.POCKET_S_OPUS:
@@ -317,14 +329,21 @@ func (this *Service) ws_encode_pocket(ctx *ctx.ClientContext, pkt pocket.Pocket)
 
 	pocket_type := uint16(pkt.GetType())
 
-	compressed, err := ctx.Compressor.Compress(payload)
-	if err != nil {
-		return nil, fmt.Errorf("compress failed: %w", err)
+	compressed := payload
+	if pkt.GetType() != pocket.POCKET_S_R_HANDSHAKE {
+		start := time.Now()
+		compressed, err = ctx.Compressor.Compress(payload)
+		if pkt.GetType() == pocket.POCKET_S_OPUS {
+			this.latency.Compression.Store(int64(time.Since(start)))
+		}
+		if err != nil {
+			return nil, fmt.Errorf("compress failed: %w", err)
+		}
 	}
 
 	compressed_length := len(compressed)
 	payload_length := len(payload)
-	if compressed_length >= payload_length {
+	if pkt.GetType() == pocket.POCKET_S_R_HANDSHAKE || compressed_length >= payload_length {
 		pocket_type |= pocket.RAW_PAYLOAD_MASK
 		compressed = payload
 		compressed_length = payload_length
@@ -394,13 +413,13 @@ func (this *Service) ws_send_opus(ctx *ctx.ClientContext, frames []*OpusFrame) e
 func (this *Service) HandleWebsocket(c *gin.Context) {
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		this.logger.Error("cannot upgrade to WebSocket", zap.Error(err))
+		this.logger.Errorw("cannot upgrade to WebSocket", "error", err)
 		return
 	}
 	defer conn.Close()
 
 	client_ctx := ctx.NewClientContext(conn, nil)
-	client_logger := this.logger.With(zap.Object("client", client_ctx))
+	client_logger := this.logger.With("client", client_ctx.Addr.String())
 	client_ctx.Logger = client_logger
 
 	close_reason := "unprovided"
@@ -431,7 +450,7 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 	_, data, err := conn.ReadMessage()
 	if err != nil {
 		close_reason = "client may close the connection"
-		client_logger.Info("client may close the connection", zap.Error(err))
+		client_logger.Infow("client may close the connection", "error", err)
 		return
 	}
 
@@ -441,7 +460,7 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 	pkt, err := this.ws_decode_pocket(client_ctx, data)
 	if err != nil {
 		close_reason = "invalid handshake pocket"
-		client_logger.Warn("invalid handshake pocket", zap.Error(err))
+		client_logger.Warnw("invalid handshake pocket", "error", err)
 		return
 	}
 
@@ -460,10 +479,10 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 		})
 		if err != nil {
 			close_reason = "handshake response send failed"
-			client_logger.Warn("cannot send handshake (response) pocket", zap.Error(err))
+			client_logger.Warnw("cannot send handshake (response) pocket", "error", err)
 			return
 		} else {
-			client_ctx.Logger.Info("client handshake", zap.String("compression", client_ctx.Compressor.Ident()), zap.Uint16("target-buffer", client_ctx.TargetBuffer))
+			client_ctx.Logger.Infow("client handshake", "compression", client_ctx.Compressor.Ident(), "target-buffer", client_ctx.TargetBuffer)
 		}
 	} else {
 		close_reason = "invalid handshake pocket"
@@ -471,7 +490,7 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 		return
 	}
 
-	client_logger = this.logger.With(zap.Object("client", client_ctx))
+	client_logger = this.logger.With("client", client_ctx.Addr.String())
 	client_ctx.Logger = client_logger
 
 	go_ctx, cancel := context.WithCancel(context.Background())
@@ -496,7 +515,7 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 			default:
 				_, data, err := conn.ReadMessage()
 				if err != nil {
-					client_logger.Info("cannot read message: client may close the connection", zap.Error(err))
+					client_logger.Infow("cannot read message: client may close the connection", "error", err)
 					recv <- &pocket.Close{
 						Type:   pocket.POCKET_CLOSE,
 						Ctx:    client_ctx,
@@ -509,7 +528,7 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 
 				pkt, err := this.ws_decode_pocket(client_ctx, data)
 				if err != nil {
-					client_logger.Warn("cannot decode pocket", zap.Error(err))
+					client_logger.Warnw("cannot decode pocket", "error", err)
 					break
 				}
 
@@ -520,13 +539,16 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 	}()
 
 	client_ctx.State = ctx.CLIENT_STATE_READY
-	client_ctx.Logger = this.logger.With(zap.Object("client", client_ctx))
+	client_ctx.Logger = this.logger.With("client", client_ctx.Addr.String())
 	client_logger = client_ctx.Logger
-	lower_watermark, upper_watermark := buffer_watermarks(client_ctx.TargetBuffer)
+	refill_watermark, upper_watermark := buffer_watermarks(client_ctx.TargetBuffer)
 	last_buffer_update := time.Now()
 	next_latency_report := time.Now().Add(LATENCY_REPORT_INTERVAL)
 	next_wake := time.Now()
+	next_send_at := time.Now()
+	last_send_at := time.Time{}
 	report_latency_on_ready := true
+	requested_buffer := uint16(0)
 
 	for {
 		wake_at := next_wake
@@ -562,16 +584,19 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 				case *pocket.Handshake:
 					new_compressor, err := typed_pkt.GetCompressor()
 					if err != nil {
-						client_logger.Warn("cannot update client compressor", zap.Error(err))
+						client_logger.Warnw("cannot update client compressor", "error", err)
 						continue
 					}
 					client_ctx.Compressor = new_compressor
 					client_ctx.CurrentBuffer = 0
 					client_ctx.CurrentSeq = 0
 					client_ctx.TargetBuffer = uint16(min(typed_pkt.TargetBuffer, this.audio_buffer.data_cap))
-					lower_watermark, upper_watermark = buffer_watermarks(client_ctx.TargetBuffer)
+					refill_watermark, upper_watermark = buffer_watermarks(client_ctx.TargetBuffer)
 					client_ctx.State = ctx.CLIENT_STATE_READY
+					requested_buffer = 0
 					report_latency_on_ready = true
+					next_send_at = time.Now()
+					last_send_at = time.Time{}
 					err = this.ws_send_pocket(client_ctx, &pocket.Handshake{
 						Type:         pocket.POCKET_S_R_HANDSHAKE,
 						Ctx:          client_ctx,
@@ -579,10 +604,10 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 						TargetBuffer: client_ctx.TargetBuffer,
 					})
 					if err != nil {
-						client_logger.Warn("cannot send re-config handshake response", zap.Error(err))
+						client_logger.Warnw("cannot send re-config handshake response", "error", err)
 						return
 					}
-					client_logger.Info("client re-config handshake", zap.String("compression", client_ctx.Compressor.Ident()), zap.Uint16("target-buffer", client_ctx.TargetBuffer))
+					client_logger.Infow("client re-config handshake", "compression", client_ctx.Compressor.Ident(), "target-buffer", client_ctx.TargetBuffer)
 					last_buffer_update = time.Now()
 				case *pocket.Close:
 					this.logger.Infof("received close pocket (source: %s): %s", typed_pkt.Source, typed_pkt.Reason)
@@ -590,8 +615,23 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 					return
 				case *pocket.Buffer:
 					client_ctx.CurrentBuffer = min(typed_pkt.CurrentBuffer, upper_watermark)
-					client_ctx.CurrentSeq = typed_pkt.CurrentSeq
+					if typed_pkt.Resync {
+						client_ctx.CurrentSeq = typed_pkt.CurrentSeq
+						requested_buffer = typed_pkt.RequestBuffer
+						if requested_buffer == 0 {
+							requested_buffer = uint16(min(
+								uint32(^uint16(0)),
+								uint32(client_ctx.TargetBuffer)+uint32(client_ctx.TargetBuffer)/2,
+							))
+						}
+						requested_buffer = min(max(requested_buffer, client_ctx.TargetBuffer), upper_watermark)
+					} else if client_ctx.State != ctx.CLIENT_STATE_STABLE || typed_pkt.CurrentSeq == client_ctx.CurrentSeq || isNewerSequence(typed_pkt.CurrentSeq, client_ctx.CurrentSeq) {
+						client_ctx.CurrentSeq = typed_pkt.CurrentSeq
+					}
 					last_buffer_update = time.Now()
+					if client_ctx.State == ctx.CLIENT_STATE_STABLE && (typed_pkt.Resync || client_ctx.CurrentBuffer <= refill_watermark) {
+						next_send_at = last_buffer_update
+					}
 				}
 			default:
 				goto controls_drained
@@ -601,14 +641,16 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 	controls_drained:
 		if should_send_latency || client_ctx.State == ctx.CLIENT_STATE_READY && report_latency_on_ready {
 			err := this.ws_send_pocket(client_ctx, &pocket.Latency{
-				Type:        pocket.POCKET_S_LATENCY,
-				Ctx:         client_ctx,
-				Opus:        this.latency.Opus.Load(),
-				AudioBuffer: this.latency.AudioBuffer.Load(),
-				WsSend:      this.latency.WsSend.Load(),
+				Type:          pocket.POCKET_S_LATENCY,
+				Ctx:           client_ctx,
+				Opus:          this.latency.Opus.Load(),
+				AudioBuffer:   this.latency.AudioBuffer.Load(),
+				WsSend:        this.latency.WsSend.Load(),
+				Compression:   this.latency.Compression.Load(),
+				Decompression: this.latency.Decompression.Load(),
 			})
 			if err != nil {
-				client_logger.Warn("cannot send latency pocket", zap.Error(err))
+				client_logger.Warnw("cannot send latency pocket", "error", err)
 				return
 			}
 			next_latency_report = time.Now().Add(LATENCY_REPORT_INTERVAL)
@@ -619,47 +661,71 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 
 		if client_ctx.State == ctx.CLIENT_STATE_READY {
 			var enough_frames []*OpusFrame
+			initial_frame_count := min(client_ctx.TargetBuffer, uint16(this.audio_buffer.data_cap))
 			if this.audio_threshold > 0 {
 				enough_frames, _ = this.audio_buffer.Last(uint16(min(this.audio_threshold, uint(^uint16(0)))))
 			}
-			if this.audio_threshold == 0 || len(enough_frames) >= int(this.audio_threshold) {
-				frames, full_range := this.audio_buffer.Last(client_ctx.TargetBuffer)
-				if !full_range {
-					client_logger.Warnf("cannot get enough last opus frames while sending POCKET_S_OPUS: %d < %d", len(frames), client_ctx.TargetBuffer)
-				}
-				if len(frames) > 0 {
+			if (this.audio_threshold == 0 || len(enough_frames) >= int(this.audio_threshold)) && initial_frame_count > 0 {
+				frames, _ := this.audio_buffer.Last(initial_frame_count)
+				if len(frames) >= int(initial_frame_count) {
 					if err := this.ws_send_opus(client_ctx, frames); err != nil {
-						client_logger.Warn("cannot send initial opus frames", zap.Error(err))
+						client_logger.Warnw("cannot send initial opus frames", "error", err)
 						return
 					}
 					client_ctx.State = ctx.CLIENT_STATE_STABLE
-					last_buffer_update = time.Now()
+					last_send_at = time.Now()
+					last_buffer_update = last_send_at
+					wait_frames := max(0, int(client_ctx.CurrentBuffer)-int(refill_watermark))
+					next_send_at = last_send_at.Add(time.Duration(wait_frames) * OPUS_FRAME_DURATION)
 				}
 			}
-		} else if client_ctx.State == ctx.CLIENT_STATE_STABLE && client_ctx.CurrentBuffer <= lower_watermark {
+		} else if client_ctx.State == ctx.CLIENT_STATE_STABLE && !now.Before(next_send_at) {
 			frames, full_range := this.audio_buffer.GetGreater(client_ctx.CurrentSeq)
-			if !full_range {
-				client_logger.Warnf("cannot get enough frames after sequence %d while sending POCKET_S_OPUS", client_ctx.CurrentSeq)
-			}
 			available := len(frames)
-			threshold := int(min(this.audio_threshold, uint(^uint16(0))))
-			if available >= threshold {
-				batch_size := min(available, int(upper_watermark-client_ctx.CurrentBuffer))
-				if batch_size > 0 {
-					if err := this.ws_send_opus(client_ctx, frames[:batch_size]); err != nil {
-						client_logger.Warn("cannot send opus frames", zap.Error(err))
-						return
+			batch_size := int(client_ctx.TargetBuffer)
+			if requested_buffer > 0 {
+				batch_size = max(0, int(requested_buffer)-int(client_ctx.CurrentBuffer))
+			} else if remaining := int(upper_watermark) - int(client_ctx.CurrentBuffer); remaining < batch_size {
+				batch_size = max(0, remaining)
+			}
+			minimum_send_size := 1
+			if this.audio_threshold > 0 {
+				minimum_send_size = min(batch_size, int(min(this.audio_threshold, uint(^uint16(0)))))
+			}
+			send_size := min(batch_size, available)
+			if batch_size > 0 && available >= minimum_send_size {
+				if !full_range {
+					cursor_gap := uint16(frames[0].seq - client_ctx.CurrentSeq)
+					log_fields := []interface{}{
+						"client_state", client_ctx.State,
+						"current_seq", client_ctx.CurrentSeq,
+						"oldest_seq", frames[0].seq,
+						"newest_seq", frames[len(frames)-1].seq,
+						"available_frames", available,
+						"current_buffer", client_ctx.CurrentBuffer,
+						"skipped_frames", max(0, int(cursor_gap)-1),
 					}
-					last_buffer_update = time.Now()
+					if cursor_gap > uint16(max(4, batch_size)) {
+						client_logger.Warnw("client cursor fell behind audio ring buffer; resyncing to oldest frame", log_fields...)
+					} else {
+						client_logger.Debugw("client cursor resynced to audio ring buffer", log_fields...)
+					}
 				}
+				if err := this.ws_send_opus(client_ctx, frames[:send_size]); err != nil {
+					client_logger.Warnw("cannot send opus frames", "error", err)
+					return
+				}
+				last_send_at = time.Now()
+				last_buffer_update = last_send_at
+				requested_buffer = 0
+				wait_frames := max(0, int(client_ctx.CurrentBuffer)-int(refill_watermark))
+				next_send_at = last_send_at.Add(time.Duration(wait_frames) * OPUS_FRAME_DURATION)
+			} else {
+				next_send_at = time.Now().Add(OPUS_FRAME_DURATION)
 			}
 		}
 
-		wait_frames := int(client_ctx.CurrentBuffer) - int(lower_watermark)
-		if wait_frames < 1 {
-			wait_frames = 1
-		}
-		next_wake = time.Now().Add(time.Duration(wait_frames) * OPUS_FRAME_DURATION)
+		next_wake = next_send_at
 	}
 }
 

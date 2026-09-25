@@ -31,6 +31,12 @@ test('sends buffer and close pockets with BSON payloads', () => {
   assert.equal(deserialize(packet.payload).r, 'client stopped')
 })
 
+test('encodes a critical buffer resync request', () => {
+  const packet = decodePocket(encodeBuffer(2, 65535, true, 12).buffer)
+  assert.equal(packet.type, PocketType.Buffer)
+  assert.deepEqual(deserialize(packet.payload), { cb: 2, cs: 65535, rs: true, rb: 12 })
+})
+
 test('decodes handshake and close response fields', () => {
   assert.equal(decodeHandshake(serialize({ c: 'none', tb: 40 })), 40)
   assert.equal(decodeClose(serialize({ r: 'closing' })), 'closing')
@@ -51,10 +57,12 @@ test('rejects truncated and compressed pockets', () => {
 })
 
 test('decodes server latency fields in nanoseconds', () => {
-  assert.deepEqual(decodeLatency(serialize({ o: 1_200_000, ab: 50_000, ws: 3_000_000 })), {
+  assert.deepEqual(decodeLatency(serialize({ o: 1_200_000, ab: 50_000, ws: 3_000_000, c: 4_000, d: 5_000 })), {
     opus: 1_200_000,
     audioBuffer: 50_000,
     wsSend: 3_000_000,
+    compression: 4_000,
+    decompression: 5_000,
   })
   assert.throws(() => decodeLatency(serialize({ o: -1, ab: 0, ws: 0 })), /延迟数据无效/)
 })

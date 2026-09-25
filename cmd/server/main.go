@@ -46,7 +46,7 @@ func main() {
 
 	service, err := core.NewServiceWithAudioThreshold(logger, args.BufferRate, args.AudioThreshold)
 	if err != nil {
-		logger.Fatal("cannot create/init service", zap.Error(err))
+		logger.Fatalw("cannot create/init service", "error", err)
 	}
 
 	r := gin.Default()
@@ -60,7 +60,7 @@ func main() {
 
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatal("server cashed", zap.Error(err))
+			logger.Fatalw("server crashed", "error", err)
 		}
 	}()
 
@@ -75,7 +75,7 @@ func main() {
 	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
-		logger.Warn("server shutdown error", zap.Error(err))
+		logger.Warnw("server shutdown error", "error", err)
 	}
 
 	logger.Info("server exited")

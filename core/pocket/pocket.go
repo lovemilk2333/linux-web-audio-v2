@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/lovemilk2333/linux-web-audio-v2/core/ctx"
-	"go.uber.org/zap"
 )
 
 type PocketType uint16
@@ -87,7 +86,7 @@ func (this *Handshake) GetCompressor() (ctx.Compressor, error) {
 	case "zstd":
 		compressor, err := ctx.NewZstdCompressor(this.Ctx, level)
 		if err != nil {
-			logger.Warn("cannot create zstd compressor", zap.Error(err))
+			logger.Warnw("cannot create zstd compressor", "error", err)
 			return ctx.NONE_COMPRESSOR, err
 		}
 
@@ -95,7 +94,7 @@ func (this *Handshake) GetCompressor() (ctx.Compressor, error) {
 	case "gz", "gzip":
 		compressor, err := ctx.NewGzipCompressor(this.Ctx, level)
 		if err != nil {
-			logger.Warn("cannot create gzip compressor", zap.Error(err))
+			logger.Warnw("cannot create gzip compressor", "error", err)
 			return ctx.NONE_COMPRESSOR, err
 		}
 
@@ -103,7 +102,7 @@ func (this *Handshake) GetCompressor() (ctx.Compressor, error) {
 	case "lz4":
 		compressor, err := ctx.NewLZ4Compressor(this.Ctx, level)
 		if err != nil {
-			logger.Warn("cannot create lz4 compressor", zap.Error(err))
+			logger.Warnw("cannot create lz4 compressor", "error", err)
 			return ctx.NONE_COMPRESSOR, nil
 		}
 
@@ -125,10 +124,12 @@ type Close struct {
 }
 
 type Latency struct {
-	PocketBase  `bson:"-"`
-	Opus        int64 `bson:"o"`
-	AudioBuffer int64 `bson:"ab"`
-	WsSend      int64 `bson:"ws"`
+	PocketBase    `bson:"-"`
+	Opus          int64 `bson:"o"`
+	AudioBuffer   int64 `bson:"ab"`
+	WsSend        int64 `bson:"ws"`
+	Compression   int64 `bson:"c"`
+	Decompression int64 `bson:"d"`
 }
 
 /*
@@ -147,4 +148,6 @@ type Buffer struct {
 	PocketBase
 	CurrentBuffer uint16 `bson:"cb"`
 	CurrentSeq    uint16 `bson:"cs"`
+	Resync        bool   `bson:"rs,omitempty"`
+	RequestBuffer uint16 `bson:"rb,omitempty"`
 }
