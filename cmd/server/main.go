@@ -23,8 +23,9 @@ var args struct {
 	BasePath string `arg:"-b,--base" help:"base url path which starts with '/'" default:"/backend/v2/"`
 	Listen   string `arg:"-l,--listen" help:"listen at" default:":8643"`
 	// 10ms * 100 = 1s
-	BufferRate     uint `arg:"--buffer-rate,--buf" help:"opus buffer rate, which means duration = 10ms * this" default:"400"`
+	BufferRate     uint `arg:"--buffer-rate,--buf" help:"opus buffer rate, which means duration = 10ms * this" default:"100"`
 	AudioThreshold uint `arg:"--audio-threshold,--threshold" help:"minimum audio frames before sending a packet" default:"4"`
+	IdleThreshold  uint `arg:"--idle-threshold" help:"stop recording after this many idle seconds; 0 disables automatic stopping" default:"30"`
 }
 
 func check_args() error {
@@ -47,13 +48,14 @@ func main() {
 		log.Panicln(err)
 	}
 
-	service, err := core.NewServiceWithAudioThreshold(logger, args.BufferRate, args.AudioThreshold)
+	service, err := core.NewServiceWithIdleThreshold(logger, args.BufferRate, args.AudioThreshold, time.Duration(args.IdleThreshold)*time.Second)
 	if err != nil {
 		logger.Fatalw("cannot create/init service", "error", err)
 	}
 
 	r := gin.Default()
 	router := r.Group(args.BasePath)
+	router.GET("/config", service.HandleConfig)
 	router.GET("/stream", service.HandleWebsocket)
 
 	srv := &http.Server{

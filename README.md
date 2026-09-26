@@ -89,11 +89,17 @@ go run ./cmd/server \
   --listen :8643 \
   --base /backend/v2/ \
   --buffer-rate 400 \
-  --audio-threshold 4
+  --audio-threshold 4 \
+  --idle-threshold 30
 ```
 
 `buffer-rate` 的单位是 10 ms/帧；`audio-threshold` 表示服务端发送音频 pocket
-前至少需要的 Opus 帧数。没有足够音频数据时不会发送空 pocket。
+前至少需要的 Opus 帧数。没有足够音频数据时不会发送空 pocket。`idle-threshold`
+表示没有客户端连接时，服务端等待多少秒后停止 Pulse 录音；设置为 `0` 可禁用自动停止。
+
+服务端启动时不会自动开始录音。第一个客户端连接后才启动 Pulse 录音，最后一个客户端
+断开后按 `idle-threshold` 停止录音。前端通过 `GET /backend/v2/config` 获取 BSON 配置，
+其中 `bufferRate` 是客户端目标缓冲滑条的最大值。
 
 ## 部署
 

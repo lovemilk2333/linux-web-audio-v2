@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,14 +32,11 @@ const AUDIO_CAPTURE_LATENCY = 20 * time.Millisecond
 const LATENCY_REPORT_INTERVAL = 250 * time.Millisecond
 
 func buffer_watermarks(target uint16) (uint16, uint16) {
-	refill_at := uint32(target) / 2
-	if target <= 2 {
-		refill_at = 2
-	}
+	refill_at := (uint32(target) + 1) / 2
 	if refill_at > uint32(^uint16(0)) {
 		refill_at = uint32(^uint16(0))
 	}
-	upper := uint32(target) + refill_at
+	upper := (uint32(target)*5 + 3) / 4
 	if upper > uint32(^uint16(0)) {
 		upper = uint32(^uint16(0))
 	}
@@ -123,36 +121,28 @@ type Service struct {
 	logger          *zap.SugaredLogger
 	buffer_rate     uint
 	audio_threshold uint
+	idle_threshold  time.Duration
 	pcm_buffer      []float32
 	opus_buffer     []byte
 	audio_seq       uint16
 	audio_buffer    *RingBuffer[uint16, *OpusFrame]
-	clients         map[*websocket.Conn]*ctx.ClientContext
 	// min length for opus encode pmc
 	pcm_frame_length uint
 	sizer            *OpusSizer
 	encoder          *opus.Encoder
 	pulse_client     *pulse.Client
 	pulse_stream     *pulse.RecordStream
+	lifecycle_mu     sync.Mutex
+	capture_mu       sync.Mutex
+	active_clients   atomic.Uint32
+	idle_timer       *time.Timer
+	recording        atomic.Bool
+	closed           bool
 
 	latency ServiceLatency
 }
 
 func (this *Service) Init() error {
-	client, err := pulse.NewClient()
-	if err != nil {
-		this.logger.Errorw("cannot create pulse client", "error", err)
-		return err
-	}
-
-	sink, err := client.DefaultSink()
-	if err != nil {
-		this.logger.Errorw("cannot get pulse default sink", "error", err)
-		return err
-	} else {
-		this.logger.Debugw("got default pulse sink", "sink", sink.Name())
-	}
-
 	encoder, err := opus.NewEncoder(SAMPLE_RATE, CHANNELS, opus.AppAudio)
 	if err != nil {
 		this.logger.Errorw("cannot create opus encoder", "error", err)
@@ -167,91 +157,177 @@ func (this *Service) Init() error {
 	}
 
 	this.sizer = sizer
-	this.pulse_client = client
-
 	this.pcm_frame_length = this.sizer.PCMFrameLength()
-
 	this.pcm_buffer = make([]float32, 0, this.pcm_frame_length*8)
 	this.opus_buffer = make([]byte, 1024)
-	// 1000ms = 10ms * 100
-
 	this.audio_buffer = NewRingBuffer[uint16, *OpusFrame](uint16(this.buffer_rate))
+	return nil
+}
+
+func (this *Service) capturePCM(frame []float32) (int, error) {
+	frame_length := len(frame)
+	if frame_length == 0 {
+		return 0, nil
+	}
+
+	this.capture_mu.Lock()
+	defer this.capture_mu.Unlock()
+	if !this.recording.Load() {
+		return frame_length, nil
+	}
+
+	this.pcm_buffer = append(this.pcm_buffer, frame...)
 	audio_lock := this.audio_buffer.GetLock()
+	for len(this.pcm_buffer) >= int(this.pcm_frame_length) {
+		start := time.Now()
+		frame_data := this.pcm_buffer[:this.pcm_frame_length]
+		opus_length, err := this.encoder.EncodeFloat32(frame_data, this.opus_buffer)
+		this.pcm_buffer = this.pcm_buffer[this.pcm_frame_length:]
+		if err != nil {
+			this.logger.Warnf("cannot encode PCM to Opus: %v\n", err)
+			continue
+		}
 
-	callback := pulse.Float32Writer(
-		func(frame []float32) (int, error) {
-			frame_length := len(frame)
-			if frame_length == 0 {
-				return 0, nil
-			}
+		encoded_data := make([]byte, opus_length)
+		copy(encoded_data, this.opus_buffer[:opus_length])
+		this.latency.Opus.Store(int64(time.Since(start)))
 
-			this.pcm_buffer = append(this.pcm_buffer, frame...)
+		start = time.Now()
+		audio_lock.Lock()
+		this.audio_buffer.Append(&OpusFrame{seq: this.audio_seq, data: encoded_data})
+		this.audio_seq++
+		audio_lock.Unlock()
+		this.latency.AudioBuffer.Store(int64(time.Since(start)))
+	}
+	if len(this.pcm_buffer) == 0 {
+		this.pcm_buffer = this.pcm_buffer[:0]
+	}
+	return frame_length, nil
+}
 
-			for len(this.pcm_buffer) >= int(this.pcm_frame_length) {
-				start := time.Now()
-
-				frame_data := this.pcm_buffer[:this.pcm_frame_length]
-
-				opus_length, err := this.encoder.EncodeFloat32(frame_data, this.opus_buffer)
-
-				this.pcm_buffer = this.pcm_buffer[this.pcm_frame_length:]
-
-				if err != nil {
-					this.logger.Warnf("cannot encode PCM to Opus: %v\n", err)
-					continue
-				}
-
-				// copy
-				encoded_data := make([]byte, opus_length)
-				copy(encoded_data, this.opus_buffer[:opus_length])
-
-				this.latency.Opus.Store(int64(time.Since(start)))
-
-				start = time.Now()
-
-				audio_lock.Lock()
-				this.audio_buffer.Append(&OpusFrame{
-					seq:  this.audio_seq,
-					data: encoded_data,
-				})
-				this.audio_seq++
-				audio_lock.Unlock()
-
-				this.latency.AudioBuffer.Store(int64(time.Since(start)))
-			}
-
-			if len(this.pcm_buffer) == 0 {
-				this.pcm_buffer = this.pcm_buffer[:0]
-			}
-
-			return frame_length, nil
-		},
-	)
-
+func (this *Service) startRecordingLocked() error {
+	if this.recording.Load() {
+		return nil
+	}
+	client, err := pulse.NewClient()
+	if err != nil {
+		return fmt.Errorf("create pulse client: %w", err)
+	}
+	sink, err := client.DefaultSink()
+	if err != nil {
+		client.Close()
+		return fmt.Errorf("get pulse default sink: %w", err)
+	}
 	stream, err := client.NewRecord(
-		callback,
+		pulse.Float32Writer(this.capturePCM),
 		pulse.RecordSampleRate(SAMPLE_RATE),
 		pulse.RecordStereo,
 		pulse.RecordLatency(AUDIO_CAPTURE_LATENCY.Seconds()),
 		pulse.RecordMonitor(sink),
 	)
 	if err != nil {
-		this.logger.Errorf("create pulse record stream error: %v", err)
-		return err
+		client.Close()
+		return fmt.Errorf("create pulse record stream: %w", err)
 	}
 
+	this.capture_mu.Lock()
+	this.pcm_buffer = this.pcm_buffer[:0]
+	this.recording.Store(true)
+	this.capture_mu.Unlock()
+	this.pulse_client = client
 	this.pulse_stream = stream
 	stream.Start()
 	this.logger.Info("pulse record stream started")
-
 	return nil
 }
 
-func (this *Service) Close() {
-	this.pulse_stream.Stop()
-	this.pulse_client.Close()
+func (this *Service) stopRecordingLocked() {
+	if !this.recording.Load() {
+		return
+	}
+	this.capture_mu.Lock()
+	this.recording.Store(false)
+	this.capture_mu.Unlock()
+	if this.pulse_stream != nil {
+		this.pulse_stream.Stop()
+		this.pulse_stream.Close()
+	}
+	if this.pulse_client != nil {
+		this.pulse_client.Close()
+	}
+	this.pulse_stream = nil
+	this.pulse_client = nil
 
+	this.capture_mu.Lock()
+	this.pcm_buffer = this.pcm_buffer[:0]
+	this.audio_seq = 0
+	audio_lock := this.audio_buffer.GetLock()
+	audio_lock.Lock()
+	this.audio_buffer.data_length = 0
+	this.audio_buffer.updateRange()
+	audio_lock.Unlock()
+	this.capture_mu.Unlock()
 	this.logger.Info("pulse record stream stopped")
+}
+
+func (this *Service) acquireClient() error {
+	this.lifecycle_mu.Lock()
+	defer this.lifecycle_mu.Unlock()
+	if this.closed {
+		return fmt.Errorf("service is closed")
+	}
+	if this.idle_timer != nil {
+		this.idle_timer.Stop()
+		this.idle_timer = nil
+	}
+	if this.active_clients.Load() == 0 {
+		if err := this.startRecordingLocked(); err != nil {
+			return err
+		}
+	}
+	this.active_clients.Add(1)
+	return nil
+}
+
+func (this *Service) releaseClient() {
+	this.lifecycle_mu.Lock()
+	defer this.lifecycle_mu.Unlock()
+	if this.active_clients.Load() > 0 {
+		this.active_clients.Add(^uint32(0))
+	}
+	if this.active_clients.Load() != 0 || !this.recording.Load() || this.idle_threshold <= 0 {
+		return
+	}
+	this.idle_timer = time.AfterFunc(this.idle_threshold, func() {
+		this.lifecycle_mu.Lock()
+		defer this.lifecycle_mu.Unlock()
+		if this.active_clients.Load() == 0 && !this.closed {
+			this.idle_timer = nil
+			this.stopRecordingLocked()
+		}
+	})
+}
+
+func (this *Service) Close() {
+	this.lifecycle_mu.Lock()
+	defer this.lifecycle_mu.Unlock()
+	this.closed = true
+	if this.idle_timer != nil {
+		this.idle_timer.Stop()
+		this.idle_timer = nil
+	}
+	this.stopRecordingLocked()
+}
+
+func (this *Service) HandleConfig(c *gin.Context) {
+	data, err := bson.Marshal(struct {
+		BufferRate uint `bson:"bufferRate"`
+	}{BufferRate: this.buffer_rate})
+	if err != nil {
+		c.Status(http.StatusInternalServerError)
+		return
+	}
+	c.Data(http.StatusOK, "application/bson", data)
 }
 
 func (this *Service) ws_decode_pocket(ctx *ctx.ClientContext, data []byte) (pocket.Pocket, error) {
@@ -435,6 +511,12 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 	client_ctx.Logger = client_logger
 
 	close_reason := "unprovided"
+	client_acquired := false
+	defer func() {
+		if client_acquired {
+			this.releaseClient()
+		}
+	}()
 
 	defer func() { // closure to keep `close_reason` newest
 		if len(close_reason) == 0 {
@@ -483,6 +565,12 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 		client_ctx.Compressor, _ = handshake.GetCompressor()
 		client_ctx.CurrentBuffer = 0
 		client_ctx.TargetBuffer = uint16(min(handshake.TargetBuffer, this.audio_buffer.data_cap))
+		if err := this.acquireClient(); err != nil {
+			close_reason = fmt.Sprintf("start recording failed: %v", err)
+			client_logger.Warnw("cannot start recording", "error", err)
+			return
+		}
+		client_acquired = true
 
 		err := this.ws_send_pocket(client_ctx, &pocket.Handshake{
 			Type:         pocket.POCKET_S_R_HANDSHAKE,
@@ -812,15 +900,19 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 }
 
 func NewService(logger *zap.SugaredLogger, buffer_rate uint) (*Service, error) {
-	return NewServiceWithAudioThreshold(logger, buffer_rate, 4)
+	return NewServiceWithIdleThreshold(logger, buffer_rate, 4, 0)
 }
 
 func NewServiceWithAudioThreshold(logger *zap.SugaredLogger, buffer_rate uint, audio_threshold uint) (*Service, error) {
+	return NewServiceWithIdleThreshold(logger, buffer_rate, audio_threshold, 0)
+}
+
+func NewServiceWithIdleThreshold(logger *zap.SugaredLogger, buffer_rate uint, audio_threshold uint, idle_threshold time.Duration) (*Service, error) {
 	service := &Service{
 		logger:          logger,
-		clients:         make(map[*websocket.Conn]*ctx.ClientContext),
 		buffer_rate:     buffer_rate,
 		audio_threshold: audio_threshold,
+		idle_threshold:  idle_threshold,
 		latency:         ServiceLatency{},
 	}
 

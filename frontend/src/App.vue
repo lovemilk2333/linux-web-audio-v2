@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { deserialize } from 'bson'
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { createDecoder } from 'libopus-wasm'
 import playerWorkletUrl from '/player.js?url'
@@ -39,6 +40,7 @@ const serverCompressionLatencyMs = ref<number | null>(null)
 const serverDecompressionLatencyMs = ref<number | null>(null)
 const audioOutputLatencyMs = ref(0)
 const bufferRate = ref(10)
+const maxBufferRate = ref(400)
 const gainDb = ref(0)
 const selectedCompression = ref<Compression>('zstd:1')
 const streamAddress = ref('')
@@ -55,7 +57,7 @@ const bufferWatermarkLabel = computed(() => {
   const watermarks = getBufferWatermarks(negotiatedBuffer.value)
   return `余量 ${watermarks.lower} 帧时补发 · 上限 ${watermarks.upper} 帧`
 })
-const sliderFill = computed(() => `${((bufferRate.value - 1) / 399) * 100}%`)
+const sliderFill = computed(() => `${((bufferRate.value - 1) / Math.max(1, maxBufferRate.value - 1)) * 100}%`)
 const gainSliderFill = computed(() => `${((gainDb.value + 30) / 54) * 100}%`)
 const statusLabel = computed(() => ({
   idle: '未连接', preparing: '准备中', connecting: '连接中', handshaking: '握手中',
@@ -162,11 +164,34 @@ function getStreamUrl() {
   return url
 }
 
+function getConfigUrl() {
+  const url = getStreamUrl()
+  url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:'
+  if (url.pathname.endsWith('/stream')) {
+    url.pathname = `${url.pathname.slice(0, -'/stream'.length)}/config`
+  } else {
+    url.pathname = `${url.pathname.replace(/\/$/, '')}/config`
+  }
+  return url
+}
+
+async function loadServerConfig() {
+  const response = await fetch(getConfigUrl(), { headers: { Accept: 'application/bson' } })
+  if (!response.ok) throw new Error(`读取服务端配置失败：HTTP ${response.status}`)
+  const config = deserialize(new Uint8Array(await response.arrayBuffer())) as { bufferRate?: unknown }
+  if (!Number.isInteger(config.bufferRate) || (config.bufferRate as number) < 1 || (config.bufferRate as number) > 0xffff) {
+    throw new Error('服务端配置中的 bufferRate 无效')
+  }
+  maxBufferRate.value = config.bufferRate as number
+  if (bufferRate.value > maxBufferRate.value) bufferRate.value = maxBufferRate.value
+  debugLog('server-config', { maxBufferRate: maxBufferRate.value })
+}
+
 function getBufferWatermarks(target: number) {
-  const lower = target <= 2 ? 2 : Math.floor(target / 2)
+  const lower = Math.ceil(target / 2)
   return {
     lower,
-    upper: Math.min(0xffff, target + lower),
+    upper: Math.min(0xffff, Math.ceil(target * 1.25)),
   }
 }
 
@@ -533,6 +558,12 @@ async function start() {
     await context.resume()
     if (active !== session) return
 
+    try {
+      await loadServerConfig()
+    } catch (error) {
+      debugLog('server-config-failed', { error: error instanceof Error ? error.message : String(error) })
+    }
+
     const decoder = await createDecoder({ sampleRate: 48000, channels: 2 })
     if (active !== session) {
       decoder.free()
@@ -812,13 +843,13 @@ onUnmounted(() => {
           class="range-input"
           type="range"
           min="1"
-          max="400"
+          :max="maxBufferRate"
           step="1"
           @change="scheduleReconfigure"
           :style="{ '--range-fill': sliderFill }"
           aria-label="目标缓冲帧数"
         >
-        <div class="range-labels"><span>1 帧</span><span>400 帧</span></div>
+        <div class="range-labels"><span>1 帧</span><span>{{ maxBufferRate }} 帧</span></div>
         <p class="field-note">播放前会等待目标帧数；运行中修改后自动重新协商。</p>
         <div class="gain-control">
           <div class="setting-row">

@@ -3,13 +3,47 @@ package core
 import (
 	"encoding/binary"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/hraban/opus"
 	"github.com/lovemilk2333/linux-web-audio-v2/core/ctx"
 	"github.com/lovemilk2333/linux-web-audio-v2/core/pocket"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.uber.org/zap"
 )
+
+func TestHandleConfig(t *testing.T) {
+	service, err := NewService(zap.NewNop().Sugar(), 123)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+
+	router := gin.New()
+	router.GET("/config", service.HandleConfig)
+	request := httptest.NewRequest(http.MethodGet, "/config", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("config status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if got, want := response.Header().Get("Content-Type"), "application/bson"; got != want {
+		t.Fatalf("config content type = %q, want %q", got, want)
+	}
+	var config struct {
+		BufferRate uint `bson:"bufferRate"`
+	}
+	if err := bson.Unmarshal(response.Body.Bytes(), &config); err != nil {
+		t.Fatal(err)
+	}
+	if config.BufferRate != 123 {
+		t.Fatalf("config bufferRate = %d, want 123", config.BufferRate)
+	}
+}
 
 func TestOpusFrameDuration(t *testing.T) {
 	sizer, err := NewOpusSizer(SAMPLE_RATE, CHANNELS, OPUS_BITRATE, DURATION_RATE)
@@ -48,17 +82,17 @@ func TestBufferWatermarks(t *testing.T) {
 		lower  uint16
 		upper  uint16
 	}{
-		{target: 0, lower: 2, upper: 2},
-		{target: 1, lower: 2, upper: 3},
-		{target: 2, lower: 2, upper: 4},
-		{target: 3, lower: 1, upper: 4},
-		{target: 4, lower: 2, upper: 6},
-		{target: 5, lower: 2, upper: 7},
-		{target: 8, lower: 4, upper: 12},
-		{target: 20, lower: 10, upper: 30},
-		{target: 21, lower: 10, upper: 31},
-		{target: 400, lower: 200, upper: 600},
-		{target: ^uint16(0), lower: ^uint16(0) / 2, upper: ^uint16(0)},
+		{target: 0, lower: 0, upper: 0},
+		{target: 1, lower: 1, upper: 2},
+		{target: 2, lower: 1, upper: 3},
+		{target: 3, lower: 2, upper: 4},
+		{target: 4, lower: 2, upper: 5},
+		{target: 5, lower: 3, upper: 7},
+		{target: 8, lower: 4, upper: 10},
+		{target: 20, lower: 10, upper: 25},
+		{target: 21, lower: 11, upper: 27},
+		{target: 400, lower: 200, upper: 500},
+		{target: ^uint16(0), lower: 32768, upper: ^uint16(0)},
 	}
 	for _, test := range tests {
 		lower, upper := buffer_watermarks(test.target)
