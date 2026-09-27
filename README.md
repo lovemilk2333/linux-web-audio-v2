@@ -1,29 +1,29 @@
 # linux-web-audio-v2
 
-通过 PipeWire/PulseAudio 捕获桌面音频，使用 Opus 编码后通过 WebSocket 推送到浏览器。
-浏览器端使用 Web Audio、AudioWorklet 和 `libopus-wasm` 解码播放。
+通过 PipeWire/PulseAudio 捕获桌面音频, 使用 Opus 编码后通过 WebSocket 推送到浏览器.
+浏览器端使用 Web Audio, AudioWorklet 和 `libopus-wasm` 解码播放.
 
 ## 依赖
 
-运行服务端需要 Linux 音频会话和 Opus/PulseAudio 开发文件：
+运行服务端需要 Linux 音频会话和 Opus/PulseAudio 开发文件:
 
 ```sh
 # Arch Linux
 sudo pacman -S base-devel go nodejs pnpm opus pipewire pipewire-pulse
 ```
 
-服务端使用 CGO 访问 PulseAudio/PipeWire 兼容接口，因此发布构建默认使用
-`CGO_ENABLED=1`，应在目标 Linux 环境或兼容的交叉编译环境中构建。
+服务端使用 CGO 访问 PulseAudio/PipeWire 兼容接口, 因此发布构建默认使用
+`CGO_ENABLED=1`, 应在目标 Linux 环境或兼容的交叉编译环境中构建.
 
 ## 构建
 
-生成 Go 和前端发布产物：
+生成 Go 和前端发布产物:
 
 ```sh
 make release
 ```
 
-产物位于：
+产物位于:
 
 ```text
 build/
@@ -32,57 +32,66 @@ build/
 └── web/                # 前端静态文件
 ```
 
-Go 发布二进制默认使用 `GOAMD64=v2`，并使用 `-trimpath -ldflags="-s -w"`，移除调试信息和符号表。
-Makefile 默认使用串行 Go 编译（`GOMAXPROCS=1`、`-p=1`），并关闭实验特性、固定使用本地工具链，
-以兼容部分设备上的 Go 编译器和仅支持 x86-64-v2 的设备；这些参数都可以通过同名变量覆盖。
-前端发布构建使用 Vite，按 Chrome 96 可运行的 ES2022 语法输出，关闭 sourcemap，并启用 JS/CSS
-压缩和标识符混淆。前端发布构建默认使用相对资源路径 `./`，不会把 `/audio/` 或
-其他部署前缀固定写入静态文件，外部访问路径由 Caddy 配置处理。
+Go 发布二进制默认根据构建机 CPU 支持的最高 x86-64 等级设置 `GOAMD64`, 并使用
+`-trimpath -ldflags="-s -w"`, 移除调试信息和符号表.
+支持使用 `make release-v3` 构建仅面向 x86-64-v3 的版本, 也可以直接传入 `GOAMD64=v3`.
+Makefile 默认使用串行 Go 编译 (`GOMAXPROCS=1`, `-p=1`), 并关闭实验特性, 固定使用本地工具链,
+以兼容部分设备上的 Go 编译器和仅支持 x86-64-v2 的设备; 这些参数都可以通过同名变量覆盖.
+前端发布构建使用 Vite, 按 Chrome 96 可运行的 ES2022 语法输出, 关闭 sourcemap, 并启用 JS/CSS
+压缩和标识符混淆. 前端发布构建默认使用相对资源路径 `./`, 不会把 `/audio/` 或
+其他部署前缀固定写入静态文件, 外部访问路径由 Caddy 配置处理.
 
-常用命令：
+常用命令:
 
 ```sh
 make test   # Go 和前端协议/Worklet 测试
 make clean  # 删除 build/
 ```
 
-也可以只构建某一部分：
+也可以只构建某一部分:
 
 ```sh
 make go-release
 make frontend-release
 ```
 
-Makefile 支持覆盖常用构建参数：
+Makefile 支持覆盖常用构建参数:
 
 ```sh
 make release GOARCH=arm64
 make release GOOS=linux GOARCH=amd64 CGO_ENABLED=1
+make release GOAMD64=v2
+make release GOAMD64=v3
 make frontend-release FRONTEND_BASE=./
 ```
 
-由于服务端依赖本机音频库，跨平台交叉编译时需要准备对应的 CGO 编译器和
-`pkg-config` 配置；最简单可靠的方式是在目标 Linux 系统上执行构建。
+由于服务端依赖本机音频库, 跨平台交叉编译时需要准备对应的 CGO 编译器和
+`pkg-config` 配置; 最简单可靠的方式是在目标 Linux 系统上执行构建.
+
+> [!WARNING]
+> 如果您在虚拟机或其他可以配置 CPU 指令集特性/版本的方案中运行, 请确保启用了 CPU 的全部指令集特性以及最高支持的指令集版本, 或手动在 `make` 时指定指令集特性/版本
+>
+> 否则, 一个出现问题的实例是: 在支持 x86-64 v3 的 CPU 上运行了仅 x86-64 v2 CPU 的虚拟机并使用默认构建时, go 会输出最高的 x86-64 版本 v3, 导致在运行时 Websocket 不定期异常 RST 或直接断开连接
 
 ## 本地开发
 
-先启动服务端：
+先启动服务端:
 
 ```sh
 go run ./cmd/server
 ```
 
-再启动 Vite：
+再启动 Vite:
 
 ```sh
 pnpm --dir frontend install
 pnpm --dir frontend dev
 ```
 
-开发页面默认通过 `/backend` 将 WebSocket 代理到 `127.0.0.1:8643`。
-浏览器访问 Vite 地址后点击“开始播放”。浏览器需要支持 AudioWorklet，并允许当前页面播放音频。
+开发页面默认通过 `/backend` 将 WebSocket 代理到 `127.0.0.1:8643`.
+浏览器访问 Vite 地址后点击 "开始播放". 浏览器需要支持 AudioWorklet, 并允许当前页面播放音频.
 
-服务端参数示例：
+服务端参数示例:
 
 ```sh
 go run ./cmd/server \
@@ -93,20 +102,20 @@ go run ./cmd/server \
   --idle-threshold 30s
 ```
 
-`buffer-rate` 的单位是 10 ms/帧；`audio-threshold` 表示服务端发送音频 pocket
-前至少需要的 Opus 帧数。没有足够音频数据时不会发送空 pocket。`idle-threshold`
-表示没有客户端连接时，服务端等待多久后停止 Pulse 录音，支持 `30s`、`1m` 等 Go duration
-格式；设置为 `0` 可禁用自动停止。
+`buffer-rate` 的单位是 10 ms/帧; `audio-threshold` 表示服务端发送音频 pocket
+前至少需要的 Opus 帧数. 没有足够音频数据时不会发送空 pocket. `idle-threshold`
+表示没有客户端连接时, 服务端等待多久后停止 Pulse 录音, 支持 `30s`, `1m` 等 Go duration
+格式; 设置为 `0` 可禁用自动停止.
 
-服务端启动时不会自动开始录音。第一个客户端连接后才启动 Pulse 录音，最后一个客户端
-断开后按 `idle-threshold` 停止录音。前端通过 `GET /backend/v2/config` 获取 BSON 配置，
-其中 `bufferRate` 是客户端目标缓冲滑条的最大值。
+服务端启动时不会自动开始录音. 第一个客户端连接后才启动 Pulse 录音, 最后一个客户端
+断开后按 `idle-threshold` 停止录音. 前端通过 `GET /backend/v2/config` 获取 BSON 配置,
+其中 `bufferRate` 是客户端目标缓冲滑条的最大值.
 
 ## 部署
 
 ### systemd user service
 
-服务端必须作为当前音频用户运行，不能作为没有音频会话的 system service：
+服务端必须作为当前音频用户运行, 不能作为没有音频会话的 system service:
 
 ```sh
 make release
@@ -116,24 +125,24 @@ systemctl --user daemon-reload
 systemctl --user enable --now webaudiod
 ```
 
-如果用户退出登录后仍需要保持服务运行：
+如果用户退出登录后仍需要保持服务运行:
 
 ```sh
 loginctl enable-linger "$USER"
 ```
 
-`deploy/webaudiod.service` 默认启动 `webaudiod`，并通过当前用户的
-`XDG_RUNTIME_DIR` 访问 PipeWire/PulseAudio 会话。
+`deploy/webaudiod.service` 默认启动 `webaudiod`, 并通过当前用户的
+`XDG_RUNTIME_DIR` 访问 PipeWire/PulseAudio 会话.
 
 ### Caddy
 
-`deploy/Caddyfile` 假设：
+`deploy/Caddyfile` 假设:
 
-- 前端静态文件安装到 `/path/to/website`；示例 Caddy 路由将其映射到 `/audio/`；
-- Go 服务端监听 `:8643`；
-- 其他网站请求由 `:59090` 提供。
+- 前端静态文件安装到 `/path/to/website`; 示例 Caddy 路由将其映射到 `/audio/`;
+- Go 服务端监听 `:8643`;
+- 其他网站请求由 `:59090` 提供.
 
-先部署前端文件，再按实际域名和路径修改 Caddy 配置：
+先部署前端文件, 再按实际域名和路径修改 Caddy 配置:
 
 ```sh
 make release
@@ -143,17 +152,17 @@ sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 ```
 
-反向代理中的 `flush_interval -1` 用于尽快刷新音频 WebSocket 数据，避免代理层额外聚合延迟。
+反向代理中的 `flush_interval -1` 用于尽快刷新音频 WebSocket 数据, 避免代理层额外聚合延迟.
 
 ### 前端路径说明
 
-`/audio/` 只是 `deploy/Caddyfile` 中的路由示例，不是前端的默认前缀。
-发布前端默认使用相对资源路径 `./`，因此 Caddy 可以将静态文件挂载到任意路径，
-无需把 `/audio/` 写入 `VITE_BASE_PATH`。
+`/audio/` 只是 `deploy/Caddyfile` 中的路由示例, 不是前端的默认前缀.
+发布前端默认使用相对资源路径 `./`, 因此 Caddy 可以将静态文件挂载到任意路径,
+无需把 `/audio/` 写入 `VITE_BASE_PATH`.
 
 ## 音频与压缩
 
-协议使用 48 kHz、双声道、每帧 10 ms 的 Opus 音频。前端支持：
+协议使用 48 kHz, 双声道, 每帧 10 ms 的 Opus 音频. 前端支持:
 
 - `none`
 - `gzip`
@@ -161,16 +170,16 @@ sudo systemctl reload caddy
 - `zstd:1`
 - `zstd:3`
 
-zstd/lz4 的浏览器端压缩通过 Go WASM bridge 实现。页面会显示编码、解码、AudioBuffer
-写入、WebSocket 调用和客户端缓冲等诊断数据。
+zstd/lz4 的浏览器端压缩通过 Go WASM bridge 实现. 页面会显示编码, 解码, AudioBuffer
+写入, WebSocket 调用和客户端缓冲等诊断数据.
 
-完整回归测试：
+完整回归测试:
 
 ```sh
 make test
 ```
 
-需要真实音频设备时，可额外运行：
+需要真实音频设备时, 可额外运行:
 
 ```sh
 LIVE_AUDIO_TEST=1 go test ./core -run TestLiveAudioStream -count=1 -v
