@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { deserialize } from 'bson'
-import { computed, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { createDecoder } from 'libopus-wasm'
 import playerWorkletUrl from '/player.js?url'
 import {
@@ -14,8 +14,10 @@ import {
   encodeClose,
   encodeHandshakeWithCompression,
   isNewerSequence,
+  type CaptureSettings,
   type Compression,
 } from './protocol'
+import { configUrlFor, probeConfig, streamCandidates } from './streamAddress'
 
 const status = ref<'idle' | 'preparing' | 'connecting' | 'handshaking' | 'waiting' | 'receiving' | 'error'>('idle')
 const playing = ref(false)
@@ -44,6 +46,16 @@ const maxBufferRate = ref(400)
 const gainDb = ref(0)
 const selectedCompression = ref<Compression>('zstd:1')
 const streamAddress = ref('')
+const DEFAULT_BITRATE = 96000
+const DEFAULT_SAMPLE_RATE = 48000
+const selectedDevice = ref('')
+const selectedBitrate = ref(DEFAULT_BITRATE)
+const selectedSampleRate = ref(DEFAULT_SAMPLE_RATE)
+type AudioDevice = { id: string; name: string; kind: string; sampleRate: number; channels: number; default?: boolean }
+const audioDevices = ref<AudioDevice[]>([])
+const bitrateOptions = ref<number[]>([32000, 64000, 96000, 128000, 192000, 256000, 320000, 510000])
+const sampleRateOptions = ref<number[]>([8000, 12000, 16000, 24000, 48000])
+const allowMic = ref(false)
 const negotiatedBuffer = ref<number | null>(null)
 const sessionActive = ref(false)
 const FRAME_DURATION_MS = 10
@@ -64,6 +76,17 @@ const statusLabel = computed(() => ({
   waiting: '缓冲中', receiving: '播放中', error: '连接异常',
 }[status.value]))
 const compressionLabel = computed(() => selectedCompression.value === 'none' ? '不压缩' : selectedCompression.value)
+const captureSummary = computed(() => `${(selectedSampleRate.value / 1000).toFixed(0)} kHz · ${(selectedBitrate.value / 1000).toFixed(0)} kbps`)
+const sinkDevices = computed(() => audioDevices.value.filter((device) => device.kind === 'sink' || device.kind === ''))
+const appDevices = computed(() => audioDevices.value.filter((device) => device.kind === 'app'))
+const sourceDevices = computed(() => audioDevices.value.filter((device) => device.kind === 'source'))
+function deviceLabel(device: AudioDevice) {
+  const detail = `${device.channels || 2} 声道 · ${(device.sampleRate / 1000).toFixed(0)} kHz`
+  return `${device.name || device.id}（${detail}）${device.default ? ' · 默认' : ''}`
+}
+function bitrateLabel(bitrate: number) {
+  return `${(bitrate / 1000).toFixed(0)} kbps`
+}
 const actionLabel = computed(() => sessionActive.value ? '停止播放' : '开始播放')
 
 type Decoder = Awaited<ReturnType<typeof createDecoder>>
@@ -153,38 +176,79 @@ function recordPacket(direction: 'received' | 'sent') {
   updatePacketRates(now)
 }
 
-function getStreamUrl() {
-  const address = streamAddress.value.trim() || '/backend/v2/stream'
-  const url = new URL(address, location.href)
-  if (url.protocol === 'http:') url.protocol = 'ws:'
-  else if (url.protocol === 'https:') url.protocol = 'wss:'
-  else if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
-    throw new Error('流地址必须使用 http(s) 或 ws(s) 协议')
-  }
-  return url
+function isUint(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0
 }
 
-function getConfigUrl() {
-  const url = getStreamUrl()
-  url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:'
-  if (url.pathname.endsWith('/stream')) {
-    url.pathname = `${url.pathname.slice(0, -'/stream'.length)}/config`
-  } else {
-    url.pathname = `${url.pathname.replace(/\/$/, '')}/config`
+function captureSettings(): CaptureSettings {
+  return {
+    device: selectedDevice.value,
+    bitrate: selectedBitrate.value,
+    sampleRate: selectedSampleRate.value,
   }
-  return url
 }
 
-async function loadServerConfig() {
-  const response = await fetch(getConfigUrl(), { headers: { Accept: 'application/bson' } })
+let deviceRefresh: Promise<void> | null = null
+let deviceRefreshAgain = false
+
+function refreshDevices() {
+  if (deviceRefresh) {
+    deviceRefreshAgain = true
+    return
+  }
+  deviceRefresh = (async () => {
+    const candidates = streamCandidates(streamAddress.value)
+    for (const [index, candidate] of candidates.entries()) {
+      const configUrl = configUrlFor(candidate)
+      if (candidates.length > 1) {
+        const result = await probeConfig(configUrl)
+        if (result !== 'ok' && !(result === 'unavailable' && index === candidates.length - 1)) continue
+        if (result !== 'ok') return
+      }
+      try {
+        await loadServerConfig(configUrl)
+      } catch (error) {
+        debugLog('server-config-failed', { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+  })().finally(() => {
+    deviceRefresh = null
+    if (deviceRefreshAgain) {
+      deviceRefreshAgain = false
+      refreshDevices()
+    }
+  })
+}
+
+async function loadServerConfig(configUrl: URL) {
+  const response = await fetch(configUrl, { headers: { Accept: 'application/bson' } })
   if (!response.ok) throw new Error(`读取服务端配置失败：HTTP ${response.status}`)
-  const config = deserialize(new Uint8Array(await response.arrayBuffer())) as { bufferRate?: unknown }
+  const config = deserialize(new Uint8Array(await response.arrayBuffer())) as {
+    bufferRate?: unknown
+    devices?: AudioDevice[]
+    bitrates?: unknown
+    sampleRates?: unknown
+    allowMic?: unknown
+    bitrate?: unknown
+    sampleRate?: unknown
+  }
   if (!Number.isInteger(config.bufferRate) || (config.bufferRate as number) < 1 || (config.bufferRate as number) > 0xffff) {
     throw new Error('服务端配置中的 bufferRate 无效')
   }
   maxBufferRate.value = config.bufferRate as number
   if (bufferRate.value > maxBufferRate.value) bufferRate.value = maxBufferRate.value
-  debugLog('server-config', { maxBufferRate: maxBufferRate.value })
+  if (Array.isArray(config.devices)) audioDevices.value = config.devices.filter((device) => typeof device?.id === 'string')
+  if (Array.isArray(config.bitrates) && config.bitrates.every(isUint)) bitrateOptions.value = config.bitrates
+  if (Array.isArray(config.sampleRates) && config.sampleRates.every(isUint)) sampleRateOptions.value = config.sampleRates
+  allowMic.value = config.allowMic === true
+  if (!bitrateOptions.value.includes(selectedBitrate.value) && isUint(config.bitrate)) selectedBitrate.value = config.bitrate
+  if (!sampleRateOptions.value.includes(selectedSampleRate.value) && isUint(config.sampleRate)) selectedSampleRate.value = config.sampleRate
+  debugLog('server-config', {
+    maxBufferRate: maxBufferRate.value,
+    devices: audioDevices.value.length,
+    allowMic: allowMic.value,
+  })
 }
 
 function getBufferWatermarks(target: number) {
@@ -457,9 +521,11 @@ function queueBufferReport(session: Session, bufferedFrames: number, sequence: n
   }, wait)
 }
 
+let applyingServerCapture = false
+
 function scheduleReconfigure() {
   const session = active
-  if (!session?.handshakeComplete) return
+  if (!session?.handshakeComplete || applyingServerCapture) return
   if (session.reconfigureTimer !== null) clearTimeout(session.reconfigureTimer)
   session.reconfigureTimer = setTimeout(() => {
     session.reconfigureTimer = null
@@ -470,14 +536,23 @@ function scheduleReconfigure() {
     status.value = 'handshaking'
     message.value = '正在应用播放设置…'
     try {
-      sendPacket(session, encodeHandshakeWithCompression(bufferRate.value, selectedCompression.value))
+      sendPacket(session, encodeHandshakeWithCompression(bufferRate.value, selectedCompression.value, captureSettings()))
     } catch (error) {
       fail(session, error)
     }
   }, 500)
 }
 
+let deviceRefreshTimer: ReturnType<typeof setTimeout> | null = null
+watch(streamAddress, () => {
+  if (deviceRefreshTimer !== null) clearTimeout(deviceRefreshTimer)
+  deviceRefreshTimer = setTimeout(() => {
+    deviceRefreshTimer = null
+    refreshDevices()
+  }, 300)
+})
 watch(selectedCompression, scheduleReconfigure)
+watch([selectedDevice, selectedBitrate, selectedSampleRate], scheduleReconfigure)
 watch(gainDb, (value) => {
   if (active?.gain) active.gain.gain.setTargetAtTime(10 ** (value / 20), active.context.currentTime, 0.01)
 })
@@ -558,10 +633,32 @@ async function start() {
     await context.resume()
     if (active !== session) return
 
-    try {
-      await loadServerConfig()
-    } catch (error) {
-      debugLog('server-config-failed', { error: error instanceof Error ? error.message : String(error) })
+    const candidates = streamCandidates(streamAddress.value)
+    let streamUrl = candidates[0]
+    let resolvedConfig: URL | null = null
+    for (const [index, candidate] of candidates.entries()) {
+      if (active !== session) return
+      const configUrl = configUrlFor(candidate)
+      if (candidates.length === 1) {
+        streamUrl = candidate
+        resolvedConfig = configUrl
+        break
+      }
+      const result = await probeConfig(configUrl)
+      debugLog('stream-probe', { candidate: candidate.href, result })
+      if (result === 'ok' || (result === 'unavailable' && index === candidates.length - 1)) {
+        streamUrl = candidate
+        resolvedConfig = result === 'ok' ? configUrl : null
+        if (result === 'ok') streamAddress.value = candidate.href
+        break
+      }
+    }
+    if (resolvedConfig) {
+      try {
+        await loadServerConfig(resolvedConfig)
+      } catch (error) {
+        debugLog('server-config-failed', { error: error instanceof Error ? error.message : String(error) })
+      }
     }
 
     const decoder = await createDecoder({ sampleRate: 48000, channels: 2 })
@@ -643,7 +740,7 @@ async function start() {
     node.connect(gain)
     gain.connect(context.destination)
 
-    const socket = new WebSocket(getStreamUrl())
+    const socket = new WebSocket(streamUrl)
     session.socket = socket
     socket.binaryType = 'arraybuffer'
     if (playing.value) {
@@ -656,7 +753,7 @@ async function start() {
       if (active !== session) return
       try {
         debugLog('ws-open')
-        sendPacket(session, encodeHandshakeWithCompression(bufferRate.value, session.compression))
+        sendPacket(session, encodeHandshakeWithCompression(bufferRate.value, session.compression, captureSettings()))
         if (playing.value) {
           status.value = 'handshaking'
           message.value = '已连接，等待服务端握手…'
@@ -684,8 +781,15 @@ async function start() {
             debugLog('handshake', {
               targetFrames: handshake.targetBuffer,
               compression: handshake.compression,
+              device: handshake.device,
+              bitrate: handshake.bitrate,
+              sampleRate: handshake.sampleRate,
               reconfiguring: session.reconfiguring,
             })
+            applyingServerCapture = true
+            if (handshake.bitrate > 0) selectedBitrate.value = handshake.bitrate
+            if (handshake.sampleRate > 0) selectedSampleRate.value = handshake.sampleRate
+            applyingServerCapture = false
             if (session.reconfiguring) {
               const decoder = await createDecoder({ sampleRate: 48000, channels: 2 })
               if (active !== session) {
@@ -723,7 +827,13 @@ async function start() {
               status.value = 'waiting'
               message.value = `握手完成，等待音频（服务端目标缓冲 ${handshake.targetBuffer} 帧）`
             }
-            if (handshake.targetBuffer !== bufferRate.value || handshake.compression !== selectedCompression.value) {
+            if (
+              handshake.targetBuffer !== bufferRate.value
+              || handshake.compression !== selectedCompression.value
+              || handshake.device !== selectedDevice.value
+              || (handshake.bitrate > 0 && handshake.bitrate !== selectedBitrate.value)
+              || (handshake.sampleRate > 0 && handshake.sampleRate !== selectedSampleRate.value)
+            ) {
               scheduleReconfigure()
             }
             break
@@ -785,7 +895,9 @@ function toggle() {
   else void start()
 }
 
+onMounted(refreshDevices)
 onUnmounted(() => {
+  if (deviceRefreshTimer !== null) clearTimeout(deviceRefreshTimer)
   if (active) closeSession(active)
   if (sharedContext) {
     void sharedContext.close().catch((err: unknown) => console.error('Failed to close audio context:', err))
@@ -891,13 +1003,41 @@ onUnmounted(() => {
             v-model="streamAddress"
             class="setting-input"
             type="text"
-            placeholder="默认：/backend/v2/stream"
+            placeholder="默认：/backend/v2/stream，也支持主机或根地址"
             :disabled="sessionActive"
             autocomplete="url"
             spellcheck="false"
           >
         </div>
-        <p class="field-note address-note">支持相对路径或完整 URL；留空使用默认地址。</p>
+        <p class="field-note address-note">支持相对路径或完整 URL；留空使用默认地址。未写到 /stream 时会依次尝试该地址、地址所在目录下的 /backend/v2/stream，以及在地址后追加 /backend/v2/stream。</p>
+        <div class="setting-row">
+          <label for="audio-device">音频设备</label>
+          <select id="audio-device" v-model="selectedDevice">
+            <option value="">默认输出</option>
+            <optgroup v-if="appDevices.length" label="应用">
+              <option v-for="device in appDevices" :key="device.id" :value="device.id">{{ deviceLabel(device) }}</option>
+            </optgroup>
+            <optgroup v-if="sinkDevices.length" label="输出设备">
+              <option v-for="device in sinkDevices" :key="device.id" :value="device.id">{{ deviceLabel(device) }}</option>
+            </optgroup>
+            <optgroup v-if="allowMic && sourceDevices.length" label="麦克风">
+              <option v-for="device in sourceDevices" :key="device.id" :value="device.id">{{ deviceLabel(device) }}</option>
+            </optgroup>
+          </select>
+        </div>
+        <p class="field-note">默认采集系统输出。正在播放的应用会单独列出，选中后只采集该应用。麦克风只在服务端启用 --allow-mic 时可选，切换设备无需重新连接。</p>
+        <div class="setting-row">
+          <label for="bitrate">码率</label>
+          <select id="bitrate" v-model.number="selectedBitrate">
+            <option v-for="bitrate in bitrateOptions" :key="bitrate" :value="bitrate">{{ bitrateLabel(bitrate) }}</option>
+          </select>
+        </div>
+        <div class="setting-row">
+          <label for="sample-rate">采样率</label>
+          <select id="sample-rate" v-model.number="selectedSampleRate">
+            <option v-for="rate in sampleRateOptions" :key="rate" :value="rate">{{ (rate / 1000).toFixed(0) }} kHz</option>
+          </select>
+        </div>
         <div class="setting-row">
           <label for="compression">传输压缩</label>
           <select id="compression" v-model="selectedCompression">
@@ -1004,6 +1144,6 @@ onUnmounted(() => {
 
     <p v-if="warning" class="notice warning" role="alert">{{ warning }}</p>
     <p v-if="status === 'error'" class="notice error">请检查服务端日志、代理配置及浏览器权限后重试。</p>
-    <footer class="footer-note">当前协议：Opus / 48 kHz / 双声道 · 压缩：{{ compressionLabel }}</footer>
+    <footer class="footer-note">当前协议：Opus / {{ captureSummary }} / 双声道 · 压缩：{{ compressionLabel }}</footer>
   </main>
 </template>

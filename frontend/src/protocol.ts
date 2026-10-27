@@ -133,8 +133,25 @@ export function encodePocket(type: number, data: Uint8Array): Uint8Array<ArrayBu
   return appendType(data, type, true)
 }
 
-export function encodeHandshake(targetBuffer: number, compression: Compression = 'none'): Uint8Array<ArrayBuffer> {
-  return encodePocket(PocketType.Handshake, serialize({ c: compression, tb: targetBuffer }))
+export type CaptureSettings = {
+  device?: string
+  bitrate?: number
+  sampleRate?: number
+}
+
+export function encodeHandshake(
+  targetBuffer: number,
+  compression: Compression = 'none',
+  capture: CaptureSettings = {},
+): Uint8Array<ArrayBuffer> {
+  const value: { c: Compression; tb: number; dev?: string; br?: number; sr?: number } = {
+    c: compression,
+    tb: targetBuffer,
+  }
+  if (capture.device) value.dev = capture.device
+  if (capture.bitrate) value.br = capture.bitrate
+  if (capture.sampleRate) value.sr = capture.sampleRate
+  return encodePocket(PocketType.Handshake, serialize(value))
 }
 
 export function encodeBuffer(bufferedFrames: number, sequence: number, resync = false, requestBuffer = 0): Uint8Array<ArrayBuffer> {
@@ -153,9 +170,13 @@ export async function encodePocketWithCompression(type: number, data: Uint8Array
   return appendType(compressed.length < data.length ? compressed : data, type, compressed.length >= data.length)
 }
 
-export function encodeHandshakeWithCompression(targetBuffer: number, compression: Compression): Uint8Array<ArrayBuffer> {
+export function encodeHandshakeWithCompression(
+  targetBuffer: number,
+  compression: Compression,
+  capture: CaptureSettings = {},
+): Uint8Array<ArrayBuffer> {
   // The first handshake is always raw: the server has not selected its compressor yet.
-  return encodeHandshake(targetBuffer, compression)
+  return encodeHandshake(targetBuffer, compression, capture)
 }
 
 export async function encodeBufferWithCompression(bufferedFrames: number, sequence: number, compression: Compression, resync = false, requestBuffer = 0): Promise<Uint8Array<ArrayBuffer>> {
@@ -196,12 +217,37 @@ export async function decodePocketWithCompression(data: ArrayBuffer, compression
   }
 }
 
-export function decodeHandshakeInfo(payload: Uint8Array): { compression: Compression; targetBuffer: number } {
+export type HandshakeInfo = {
+  compression: Compression
+  targetBuffer: number
+  device: string
+  bitrate: number
+  sampleRate: number
+}
+
+function optionalUint(value: unknown): number {
+  if (value === undefined || value === null) return 0
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new Error('服务端握手参数无效或使用了不支持的压缩方式')
+  }
+  return value
+}
+
+export function decodeHandshakeInfo(payload: Uint8Array): HandshakeInfo {
   const response = deserialize(payload)
   if (!Number.isInteger(response.tb) || response.tb < 0 || response.tb > 0xffff) {
     throw new Error('服务端握手参数无效或使用了不支持的压缩方式')
   }
-  return { compression: parseCompression(response.c), targetBuffer: response.tb as number }
+  if (response.dev !== undefined && typeof response.dev !== 'string') {
+    throw new Error('服务端握手参数无效或使用了不支持的压缩方式')
+  }
+  return {
+    compression: parseCompression(response.c),
+    targetBuffer: response.tb as number,
+    device: typeof response.dev === 'string' ? response.dev : '',
+    bitrate: optionalUint(response.br),
+    sampleRate: optionalUint(response.sr),
+  }
 }
 
 export function decodeHandshake(payload: Uint8Array): number {

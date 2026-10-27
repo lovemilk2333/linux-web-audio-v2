@@ -5,6 +5,7 @@ import {
   PocketType,
   decodeClose,
   decodeHandshake,
+  decodeHandshakeInfo,
   decodeLatency,
   decodePocketWithCompression,
   decodeOpusFrames,
@@ -22,6 +23,15 @@ test('sends a raw BSON handshake with the required fields', () => {
   assert.deepEqual(deserialize(packet.payload), { c: 'none', tb: 40 })
 })
 
+test('includes capture settings and omits the default device', () => {
+  const packet = decodePocket(encodeHandshake(40, 'zstd:1', {
+    device: 'source:mic0',
+    bitrate: 128000,
+    sampleRate: 16000,
+  }).buffer)
+  assert.deepEqual(deserialize(packet.payload), { c: 'zstd:1', tb: 40, dev: 'source:mic0', br: 128000, sr: 16000 })
+})
+
 test('sends buffer and close pockets with BSON payloads', () => {
   let packet = decodePocket(encodeBuffer(12, 65535).buffer)
   assert.equal(packet.type, PocketType.Buffer)
@@ -35,6 +45,17 @@ test('encodes a critical buffer resync request', () => {
   const packet = decodePocket(encodeBuffer(2, 65535, true, 12).buffer)
   assert.equal(packet.type, PocketType.Buffer)
   assert.deepEqual(deserialize(packet.payload), { cb: 2, cs: 65535, rs: true, rb: 12 })
+})
+
+test('decodes the capture settings echoed by the server', () => {
+  assert.deepEqual(decodeHandshakeInfo(serialize({ c: 'none', tb: 40, dev: 'speakers', br: 96000, sr: 48000 })), {
+    compression: 'none',
+    targetBuffer: 40,
+    device: 'speakers',
+    bitrate: 96000,
+    sampleRate: 48000,
+  })
+  assert.equal(decodeHandshakeInfo(serialize({ c: 'none', tb: 40 })).device, '')
 })
 
 test('decodes handshake and close response fields', () => {

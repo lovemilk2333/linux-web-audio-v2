@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/hraban/opus"
+	"github.com/jfreymuth/pulse/proto"
 	"github.com/lovemilk2333/linux-web-audio-v2/core/ctx"
 	"github.com/lovemilk2333/linux-web-audio-v2/core/pocket"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -33,6 +34,9 @@ func TestHandleConfig(t *testing.T) {
 	}
 	if got, want := response.Header().Get("Content-Type"), "application/bson"; got != want {
 		t.Fatalf("config content type = %q, want %q", got, want)
+	}
+	if got := response.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("config CORS origin = %q, want *", got)
 	}
 	var config struct {
 		BufferRate uint `bson:"bufferRate"`
@@ -73,6 +77,74 @@ func TestOpusFrameDuration(t *testing.T) {
 	}
 	if samples != SAMPLE_RATE/OPUS_DURATION_BASE {
 		t.Fatalf("decoded %d samples per channel, want %d", samples, SAMPLE_RATE/OPUS_DURATION_BASE)
+	}
+}
+
+func TestApplicationDeviceName(t *testing.T) {
+	input := &proto.GetSinkInputInfoReply{
+		SinkInputIndex: 7,
+		MediaName:      "Playback",
+		Properties: proto.PropList{
+			"application.name": proto.PropListString("Firefox"),
+		},
+	}
+	if got, want := applicationDeviceName(input), "Firefox · Playback"; got != want {
+		t.Fatalf("application name = %q, want %q", got, want)
+	}
+	input.Corked = true
+	if got, want := applicationDeviceName(input), "Firefox · Playback（已暂停）"; got != want {
+		t.Fatalf("corked application name = %q, want %q", got, want)
+	}
+	if _, err := recordApplication(nil, "nope"); err == nil {
+		t.Fatal("invalid application index was accepted")
+	}
+}
+
+func TestNormalizeCapture(t *testing.T) {
+	capture, err := normalizeCapture(captureConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capture.Bitrate != OPUS_BITRATE || capture.SampleRate != SAMPLE_RATE || capture.Device != "" {
+		t.Fatalf("empty request normalized to %+v", capture)
+	}
+
+	capture, err = normalizeCapture(captureConfig{Device: "source:mic0", Bitrate: 128000, SampleRate: 16000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capture.Device != "source:mic0" || capture.Bitrate != 128000 || capture.SampleRate != 16000 {
+		t.Fatalf("explicit request normalized to %+v", capture)
+	}
+
+	if _, err := normalizeCapture(captureConfig{Bitrate: 1}); err == nil {
+		t.Fatal("unsupported bitrate was accepted")
+	}
+	if _, err := normalizeCapture(captureConfig{SampleRate: 44100}); err == nil {
+		t.Fatal("unsupported sample rate was accepted")
+	}
+}
+
+func TestReconfigureCaptureWithoutPulse(t *testing.T) {
+	service, err := NewService(zap.NewNop().Sugar(), 40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+
+	capture, err := service.reconfigureCapture(captureConfig{Bitrate: 64000, SampleRate: 24000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capture.Bitrate != 64000 || capture.SampleRate != 24000 {
+		t.Fatalf("applied capture = %+v", capture)
+	}
+	if service.pcm_frame_length != 480 {
+		t.Fatalf("PCM frame length = %d, want 480 samples at 24 kHz", service.pcm_frame_length)
+	}
+	encoded := make([]byte, 1024)
+	if _, err := service.encoder.EncodeFloat32(make([]float32, service.pcm_frame_length), encoded); err != nil {
+		t.Fatal(err)
 	}
 }
 

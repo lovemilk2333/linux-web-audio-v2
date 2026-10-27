@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,6 +28,7 @@ var args struct {
 	BufferRate     uint          `arg:"--buffer-rate,--buf" help:"opus buffer rate, which means duration = 10ms * this" default:"100"`
 	AudioThreshold uint          `arg:"--audio-threshold,--threshold" help:"minimum audio frames before sending a packet" default:"4"`
 	IdleThreshold  time.Duration `arg:"--idle-threshold" help:"stop recording after this idle duration; 0 disables automatic stopping" default:"30s"`
+	AllowMic       bool          `arg:"--allow-mic" help:"allow the WebUI to capture microphone sources"`
 }
 
 func check_args() error {
@@ -34,6 +37,31 @@ func check_args() error {
 	}
 
 	return nil
+}
+
+// webUIConnectURL is the address a user can paste into the WebUI stream field.
+// A wildcard listen address is shown as localhost so the URL is usable as-is.
+func webUIConnectURL(listen, basePath string) string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		host, port = listen, ""
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		host = "localhost"
+	}
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
+	}
+
+	path := "/" + strings.Trim(basePath, "/")
+	if path == "/" {
+		path = ""
+	}
+	if port != "" {
+		return fmt.Sprintf("http://%s:%s%s/stream", host, port, path)
+	}
+	return fmt.Sprintf("http://%s%s/stream", host, path)
 }
 
 func main() {
@@ -48,23 +76,47 @@ func main() {
 		log.Panicln(err)
 	}
 
-	service, err := core.NewServiceWithIdleThreshold(logger, args.BufferRate, args.AudioThreshold, args.IdleThreshold)
+	service, err := core.NewServiceWithOptions(logger, core.ServiceOptions{
+		BufferRate:     args.BufferRate,
+		AudioThreshold: args.AudioThreshold,
+		IdleThreshold:  args.IdleThreshold,
+		AllowMic:       args.AllowMic,
+	})
 	if err != nil {
 		logger.Fatalw("cannot create/init service", "error", err)
 	}
 
 	r := gin.Default()
+	r.Use(func(c *gin.Context) {
+		// The WebUI is often opened from another origin, such as the Vite dev server.
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Headers", "Accept, Content-Type")
+		c.Header("Access-Control-Allow-Methods", "GET, OPTIONS")
+		if c.Request.Method == http.MethodOptions {
+			c.Status(http.StatusNoContent)
+			c.Abort()
+			return
+		}
+		c.Next()
+	})
 	router := r.Group(args.BasePath)
 	router.GET("/config", service.HandleConfig)
 	router.GET("/stream", service.HandleWebsocket)
 
+	listener, err := net.Listen("tcp", args.Listen)
+	if err != nil {
+		logger.Fatalw("cannot listen", "address", args.Listen, "error", err)
+	}
+	// The bound address carries the real port when --listen used port 0.
+	connectURL := webUIConnectURL(listener.Addr().String(), args.BasePath)
+	logger.Infof("connect %s from WebUI", connectURL)
+
 	srv := &http.Server{
-		Addr:    args.Listen,
 		Handler: r.Handler(),
 	}
 
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
 			logger.Fatalw("server crashed", "error", err)
 		}
 	}()

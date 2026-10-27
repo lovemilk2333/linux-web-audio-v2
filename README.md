@@ -32,11 +32,9 @@ build/
 └── web/                # 前端静态文件
 ```
 
-Go 发布二进制默认根据构建机 CPU 支持的最高 x86-64 等级设置 `GOAMD64`, 并使用
-`-trimpath -ldflags="-s -w"`, 移除调试信息和符号表.
-支持使用 `make release-v3` 构建仅面向 x86-64-v3 的版本, 也可以直接传入 `GOAMD64=v3`.
+Go 发布二进制使用 `-trimpath -ldflags="-s -w"`, 移除调试信息和符号表.
 Makefile 默认使用串行 Go 编译 (`GOMAXPROCS=1`, `-p=1`), 并关闭实验特性, 固定使用本地工具链,
-以兼容部分设备上的 Go 编译器和仅支持 x86-64-v2 的设备; 这些参数都可以通过同名变量覆盖.
+以兼容部分设备上的 Go 编译器; 这些参数都可以通过同名变量覆盖.
 前端发布构建使用 Vite, 按 Chrome 96 可运行的 ES2022 语法输出, 关闭 sourcemap, 并启用 JS/CSS
 压缩和标识符混淆. 前端发布构建默认使用相对资源路径 `./`, 不会把 `/audio/` 或
 其他部署前缀固定写入静态文件, 外部访问路径由 Caddy 配置处理.
@@ -60,18 +58,11 @@ Makefile 支持覆盖常用构建参数:
 ```sh
 make release GOARCH=arm64
 make release GOOS=linux GOARCH=amd64 CGO_ENABLED=1
-make release GOAMD64=v2
-make release GOAMD64=v3
 make frontend-release FRONTEND_BASE=./
 ```
 
 由于服务端依赖本机音频库, 跨平台交叉编译时需要准备对应的 CGO 编译器和
 `pkg-config` 配置; 最简单可靠的方式是在目标 Linux 系统上执行构建.
-
-> [!WARNING]
-> 如果您在虚拟机或其他可以配置 CPU 指令集特性/版本的方案中运行, 请确保启用了 CPU 的全部指令集特性以及最高支持的指令集版本, 或手动在 `make` 时指定指令集特性/版本
->
-> 否则, 一个出现问题的实例是: 在支持 x86-64 v3 的 CPU 上运行了仅 x86-64 v2 CPU 的虚拟机并使用默认构建时, go 会输出最高的 x86-64 版本 v3, 导致在运行时 Websocket 不定期异常 RST 或直接断开连接
 
 ## 本地开发
 
@@ -99,7 +90,8 @@ go run ./cmd/server \
   --base /backend/v2/ \
   --buffer-rate 400 \
   --audio-threshold 4 \
-  --idle-threshold 30s
+  --idle-threshold 30s \
+  --allow-mic
 ```
 
 `buffer-rate` 的单位是 10 ms/帧; `audio-threshold` 表示服务端发送音频 pocket
@@ -108,8 +100,20 @@ go run ./cmd/server \
 格式; 设置为 `0` 可禁用自动停止.
 
 服务端启动时不会自动开始录音. 第一个客户端连接后才启动 Pulse 录音, 最后一个客户端
-断开后按 `idle-threshold` 停止录音. 前端通过 `GET /backend/v2/config` 获取 BSON 配置,
-其中 `bufferRate` 是客户端目标缓冲滑条的最大值.
+断开后按 `idle-threshold` 停止录音. 服务端启动后会打印实际监听端口, 并给出可以直接
+粘贴到 WebUI 的地址, 例如 `connect http://localhost:8643/backend/v2/stream from WebUI`.
+前端通过 `GET /backend/v2/config` 获取 BSON 配置, 其中 `bufferRate` 是客户端目标缓冲
+滑条的最大值.
+
+流地址留空时使用 `/backend/v2/stream`. 如果填写的地址没有指向 `/stream`, 前端会按顺序
+探测: 先用填写的地址, 再用该地址所在目录下的 `/backend/v2/stream`, 最后在地址末尾追加
+`/backend/v2/stream`. 例如填写 `http://192.168.1.8:8643` 会连接到
+`ws://192.168.1.8:8643/backend/v2/stream`.
+
+WebUI 可以选择输出设备、Opus 码率和采样率. 默认采集默认输出的监听源, 采样率
+48 kHz, 码率 96 kbps. 修改这些选项不会断开 WebSocket, 前端只重新发送握手包.
+`--allow-mic` 额外允许选择麦克风等输入设备; 未启用时服务端会拒绝输入设备请求,
+设备列表里也不会出现它们.
 
 ## 部署
 

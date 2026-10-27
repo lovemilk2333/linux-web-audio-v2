@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/hraban/opus"
 	"github.com/jfreymuth/pulse"
+	"github.com/jfreymuth/pulse/proto"
 	"github.com/lovemilk2333/linux-web-audio-v2/core/ctx"
 	"github.com/lovemilk2333/linux-web-audio-v2/core/pocket"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -78,6 +81,10 @@ const CHANNELS = 2
 const DURATION_RATE = 1    // 1 * 10ms
 const OPUS_BITRATE = 96000 // 96kbps
 
+// Opus rejects rates outside this window, and the browser decoder is created at 48 kHz.
+var supportedSampleRates = []uint{8000, 12000, 16000, 24000, 48000}
+var supportedBitrates = []uint{32000, 64000, 96000, 128000, 192000, 256000, 320000, 510000}
+
 const WS_MAX_SINGLE_BYTE_LENGTH_OPUS_DURATION_RATE = 3
 const WS_MAX_BYTES = 1024
 const WS_HANDSHAKE_TIMEOUT = time.Second * 5
@@ -132,6 +139,8 @@ type Service struct {
 	encoder          *opus.Encoder
 	pulse_client     *pulse.Client
 	pulse_stream     *pulse.RecordStream
+	allow_mic        bool
+	capture          captureConfig
 	lifecycle_mu     sync.Mutex
 	capture_mu       sync.Mutex
 	active_clients   atomic.Uint32
@@ -143,22 +152,13 @@ type Service struct {
 }
 
 func (this *Service) Init() error {
-	encoder, err := opus.NewEncoder(SAMPLE_RATE, CHANNELS, opus.AppAudio)
-	if err != nil {
+	if this.capture.isZero() {
+		this.capture = defaultCapture()
+	}
+	if err := this.applyCaptureLocked(this.capture); err != nil {
 		this.logger.Errorw("cannot create opus encoder", "error", err)
 		return err
 	}
-	this.encoder = encoder
-
-	sizer, err := NewOpusSizer(SAMPLE_RATE, CHANNELS, OPUS_BITRATE, DURATION_RATE)
-	if err != nil {
-		this.logger.Errorw("cannot create opus sizer", "error", err)
-		return err
-	}
-
-	this.sizer = sizer
-	this.pcm_frame_length = this.sizer.PCMFrameLength()
-	this.pcm_buffer = make([]float32, 0, this.pcm_frame_length*8)
 	this.opus_buffer = make([]byte, 1024)
 	this.audio_buffer = NewRingBuffer[uint16, *OpusFrame](uint16(this.buffer_rate))
 	return nil
@@ -213,17 +213,25 @@ func (this *Service) startRecordingLocked() error {
 	if err != nil {
 		return fmt.Errorf("create pulse client: %w", err)
 	}
-	sink, err := client.DefaultSink()
+	capture := this.capture
+	if capture.isZero() {
+		capture = defaultCapture()
+	}
+	if err := this.applyCaptureLocked(capture); err != nil {
+		client.Close()
+		return err
+	}
+	source, err := this.recordSource(client, capture.Device)
 	if err != nil {
 		client.Close()
-		return fmt.Errorf("get pulse default sink: %w", err)
+		return err
 	}
 	stream, err := client.NewRecord(
 		pulse.Float32Writer(this.capturePCM),
-		pulse.RecordSampleRate(SAMPLE_RATE),
+		pulse.RecordSampleRate(int(capture.SampleRate)),
 		pulse.RecordStereo,
 		pulse.RecordLatency(AUDIO_CAPTURE_LATENCY.Seconds()),
-		pulse.RecordMonitor(sink),
+		source,
 	)
 	if err != nil {
 		client.Close()
@@ -237,7 +245,12 @@ func (this *Service) startRecordingLocked() error {
 	this.pulse_client = client
 	this.pulse_stream = stream
 	stream.Start()
-	this.logger.Info("pulse record stream started")
+	this.capture = capture
+	this.logger.Infow("pulse record stream started",
+		"device", capture.Device,
+		"bitrate", capture.Bitrate,
+		"sample-rate", capture.SampleRate,
+	)
 	return nil
 }
 
@@ -268,6 +281,181 @@ func (this *Service) stopRecordingLocked() {
 	audio_lock.Unlock()
 	this.capture_mu.Unlock()
 	this.logger.Info("pulse record stream stopped")
+}
+
+// captureConfig is the shared recording setup. An empty device follows the
+// default output; a "source:" device records an input directly.
+type captureConfig struct {
+	Device     string
+	Bitrate    uint
+	SampleRate uint
+}
+
+func defaultCapture() captureConfig {
+	return captureConfig{Bitrate: OPUS_BITRATE, SampleRate: SAMPLE_RATE}
+}
+
+func (this captureConfig) isZero() bool {
+	return this.Device == "" && this.Bitrate == 0 && this.SampleRate == 0
+}
+
+func (this captureConfig) same(other captureConfig) bool {
+	return this.Device == other.Device && this.Bitrate == other.Bitrate && this.SampleRate == other.SampleRate
+}
+
+func containsUint(values []uint, value uint) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeCapture(requested captureConfig) (captureConfig, error) {
+	capture := defaultCapture()
+	capture.Device = requested.Device
+	if requested.Bitrate != 0 {
+		if !containsUint(supportedBitrates, requested.Bitrate) {
+			return captureConfig{}, fmt.Errorf("unsupported bitrate %d", requested.Bitrate)
+		}
+		capture.Bitrate = requested.Bitrate
+	}
+	if requested.SampleRate != 0 {
+		if !containsUint(supportedSampleRates, requested.SampleRate) {
+			return captureConfig{}, fmt.Errorf("unsupported sample rate %d", requested.SampleRate)
+		}
+		capture.SampleRate = requested.SampleRate
+	}
+	return capture, nil
+}
+
+const sourceDevicePrefix = "source:"
+const appDevicePrefix = "app:"
+
+func (this *Service) recordSource(client *pulse.Client, device string) (pulse.RecordOption, error) {
+	if indexText, ok := strings.CutPrefix(device, appDevicePrefix); ok {
+		return recordApplication(client, indexText)
+	}
+	if source, ok := strings.CutPrefix(device, sourceDevicePrefix); ok {
+		if !this.allow_mic {
+			return nil, fmt.Errorf("microphone capture is disabled")
+		}
+		input, err := client.SourceByID(source)
+		if err != nil {
+			return nil, fmt.Errorf("get pulse source %q: %w", source, err)
+		}
+		return pulse.RecordSource(input), nil
+	}
+	var (
+		sink *pulse.Sink
+		err  error
+	)
+	if device == "" {
+		sink, err = client.DefaultSink()
+	} else {
+		sink, err = client.SinkByID(device)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get pulse sink %q: %w", device, err)
+	}
+	return pulse.RecordMonitor(sink), nil
+}
+
+// recordApplication monitors one playback stream instead of the whole sink.
+func recordApplication(client *pulse.Client, indexText string) (pulse.RecordOption, error) {
+	index, err := strconv.ParseUint(indexText, 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("invalid application stream %q", indexText)
+	}
+	var input proto.GetSinkInputInfoReply
+	if err := client.RawRequest(&proto.GetSinkInputInfo{SinkInputIndex: uint32(index)}, &input); err != nil {
+		return nil, fmt.Errorf("get application stream %s: %w", indexText, err)
+	}
+	var sink proto.GetSinkInfoReply
+	if err := client.RawRequest(&proto.GetSinkInfo{SinkIndex: input.SinkIndex}, &sink); err != nil {
+		return nil, fmt.Errorf("get sink for application stream %s: %w", indexText, err)
+	}
+	if sink.MonitorSourceIndex == proto.Undefined {
+		return nil, fmt.Errorf("application stream %s has no monitor source", indexText)
+	}
+	sinkInputIndex := input.SinkInputIndex
+	monitorSourceIndex := sink.MonitorSourceIndex
+	return pulse.RecordRawOption(func(stream *proto.CreateRecordStream) {
+		stream.SourceIndex = monitorSourceIndex
+		stream.DirectOnInputIndex = sinkInputIndex
+	}), nil
+}
+
+// applyCaptureLocked rebuilds the Opus encoder for a new rate or bitrate.
+// The caller holds lifecycle_mu; the capture lock keeps this off the callback.
+func (this *Service) applyCaptureLocked(capture captureConfig) error {
+	this.capture_mu.Lock()
+	defer this.capture_mu.Unlock()
+
+	encoder, err := opus.NewEncoder(int(capture.SampleRate), CHANNELS, opus.AppAudio)
+	if err != nil {
+		return fmt.Errorf("create opus encoder: %w", err)
+	}
+	if err := encoder.SetBitrate(int(capture.Bitrate)); err != nil {
+		return fmt.Errorf("set opus bitrate: %w", err)
+	}
+	sizer, err := NewOpusSizer(capture.SampleRate, CHANNELS, capture.Bitrate, DURATION_RATE)
+	if err != nil {
+		return fmt.Errorf("create opus sizer: %w", err)
+	}
+	this.encoder = encoder
+	this.sizer = sizer
+	this.pcm_frame_length = sizer.PCMFrameLength()
+	this.pcm_buffer = make([]float32, 0, this.pcm_frame_length*8)
+	return nil
+}
+
+// reconfigureCapture applies a handshake while clients stay connected.
+// Only a device or sample-rate change restarts the Pulse stream.
+func (this *Service) reconfigureCapture(requested captureConfig) (captureConfig, error) {
+	capture, err := normalizeCapture(requested)
+	if err != nil {
+		return captureConfig{}, err
+	}
+
+	this.lifecycle_mu.Lock()
+	defer this.lifecycle_mu.Unlock()
+	if this.closed {
+		return captureConfig{}, fmt.Errorf("service is closed")
+	}
+	if !this.recording.Load() {
+		if err := this.applyCaptureLocked(capture); err != nil {
+			return captureConfig{}, err
+		}
+		this.capture = capture
+		return capture, nil
+	}
+	if capture.same(this.capture) {
+		return capture, nil
+	}
+
+	restart := capture.Device != this.capture.Device || capture.SampleRate != this.capture.SampleRate
+	if !restart {
+		if err := this.applyCaptureLocked(capture); err != nil {
+			return captureConfig{}, err
+		}
+		this.capture = capture
+		this.logger.Infow("capture bitrate updated", "bitrate", capture.Bitrate)
+		return capture, nil
+	}
+
+	previous := this.capture
+	this.stopRecordingLocked()
+	this.capture = capture
+	if err := this.startRecordingLocked(); err != nil {
+		this.capture = previous
+		if restoreErr := this.startRecordingLocked(); restoreErr != nil {
+			this.logger.Warnw("cannot restore previous capture", "error", restoreErr)
+		}
+		return captureConfig{}, err
+	}
+	return capture, nil
 }
 
 func (this *Service) acquireClient() error {
@@ -319,14 +507,171 @@ func (this *Service) Close() {
 	this.stopRecordingLocked()
 }
 
+type audioDevice struct {
+	ID         string `bson:"id"`
+	Name       string `bson:"name"`
+	Kind       string `bson:"kind"`
+	SampleRate int    `bson:"sampleRate"`
+	Channels   int    `bson:"channels"`
+	Default    bool   `bson:"default,omitempty"`
+}
+
+func (this *Service) listDevices() ([]audioDevice, error) {
+	client, err := pulse.NewClient()
+	if err != nil {
+		return nil, fmt.Errorf("create pulse client: %w", err)
+	}
+	defer client.Close()
+
+	defaultSink := ""
+	if sink, err := client.DefaultSink(); err == nil {
+		defaultSink = sink.ID()
+	}
+	sinks, err := client.ListSinks()
+	if err != nil {
+		return nil, fmt.Errorf("list pulse sinks: %w", err)
+	}
+	devices := make([]audioDevice, 0, len(sinks))
+	for _, sink := range sinks {
+		devices = append(devices, audioDevice{
+			ID:         sink.ID(),
+			Name:       sink.Name(),
+			Kind:       "sink",
+			SampleRate: sink.SampleRate(),
+			Channels:   len(sink.Channels()),
+			Default:    sink.ID() == defaultSink,
+		})
+	}
+	var inputs proto.GetSinkInputInfoListReply
+	if err := client.RawRequest(&proto.GetSinkInputInfoList{}, &inputs); err != nil {
+		this.logger.Warnw("cannot list application streams", "error", err)
+	} else {
+		for _, input := range inputs {
+			devices = append(devices, audioDevice{
+				ID:         fmt.Sprintf("%s%d", appDevicePrefix, input.SinkInputIndex),
+				Name:       applicationDeviceName(input),
+				Kind:       "app",
+				SampleRate: int(input.Rate),
+				Channels:   len(input.ChannelMap),
+			})
+		}
+	}
+	if !this.allow_mic {
+		return devices, nil
+	}
+
+	defaultSource := ""
+	if source, err := client.DefaultSource(); err == nil {
+		defaultSource = source.ID()
+	}
+	sources, err := client.ListSources()
+	if err != nil {
+		return nil, fmt.Errorf("list pulse sources: %w", err)
+	}
+	monitors := map[string]struct{}{}
+	for _, sink := range sinks {
+		var reply proto.GetSinkInfoReply
+		if err := client.RawRequest(&proto.GetSinkInfo{SinkIndex: proto.Undefined, SinkName: sink.ID()}, &reply); err != nil {
+			continue
+		}
+		if reply.MonitorSourceName != "" {
+			monitors[reply.MonitorSourceName] = struct{}{}
+		}
+	}
+	for _, source := range sources {
+		if _, monitor := monitors[source.ID()]; monitor {
+			continue
+		}
+		if strings.HasSuffix(source.ID(), ".monitor") {
+			continue
+		}
+		devices = append(devices, audioDevice{
+			ID:         sourceDevicePrefix + source.ID(),
+			Name:       source.Name(),
+			Kind:       "source",
+			SampleRate: source.SampleRate(),
+			Channels:   len(source.Channels()),
+			Default:    source.ID() == defaultSource,
+		})
+	}
+	return devices, nil
+}
+
+func applicationDeviceName(input *proto.GetSinkInputInfoReply) string {
+	app := propString(input.Properties, "application.name")
+	if app == "" {
+		app = propString(input.Properties, "application.process.binary")
+	}
+	media := input.MediaName
+	name := app
+	if media != "" && media != app {
+		if name == "" {
+			name = media
+		} else {
+			name = app + " · " + media
+		}
+	}
+	if name == "" {
+		name = fmt.Sprintf("应用 %d", input.SinkInputIndex)
+	}
+	if input.Corked {
+		name += "（已暂停）"
+	}
+	return name
+}
+
+func propString(props proto.PropList, key string) string {
+	entry, ok := props[key]
+	if !ok {
+		return ""
+	}
+	value := entry.String()
+	if value == "<not a string>" {
+		return ""
+	}
+	return value
+}
+
 func (this *Service) HandleConfig(c *gin.Context) {
-	data, err := bson.Marshal(struct {
-		BufferRate uint `bson:"bufferRate"`
-	}{BufferRate: this.buffer_rate})
+	config := struct {
+		BufferRate  uint          `bson:"bufferRate"`
+		Devices     []audioDevice `bson:"devices"`
+		Bitrates    []uint        `bson:"bitrates"`
+		SampleRates []uint        `bson:"sampleRates"`
+		AllowMic    bool          `bson:"allowMic"`
+		Device      string        `bson:"device"`
+		Bitrate     uint          `bson:"bitrate"`
+		SampleRate  uint          `bson:"sampleRate"`
+	}{
+		BufferRate:  this.buffer_rate,
+		Bitrates:    supportedBitrates,
+		SampleRates: supportedSampleRates,
+		AllowMic:    this.allow_mic,
+	}
+	this.lifecycle_mu.Lock()
+	capture := this.capture
+	this.lifecycle_mu.Unlock()
+	if capture.isZero() {
+		capture = defaultCapture()
+	}
+	config.Device = capture.Device
+	config.Bitrate = capture.Bitrate
+	config.SampleRate = capture.SampleRate
+
+	devices, err := this.listDevices()
+	if err != nil {
+		this.logger.Warnw("cannot list audio devices", "error", err)
+	} else {
+		config.Devices = devices
+	}
+
+	data, err := bson.Marshal(config)
 	if err != nil {
 		c.Status(http.StatusInternalServerError)
 		return
 	}
+	c.Header("Access-Control-Allow-Origin", "*")
+	c.Header("Access-Control-Allow-Headers", "Accept, Content-Type")
 	c.Data(http.StatusOK, "application/bson", data)
 }
 
@@ -565,6 +910,16 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 		client_ctx.Compressor, _ = handshake.GetCompressor()
 		client_ctx.CurrentBuffer = 0
 		client_ctx.TargetBuffer = uint16(min(handshake.TargetBuffer, this.audio_buffer.data_cap))
+		capture, err := this.reconfigureCapture(captureConfig{
+			Device:     handshake.Device,
+			Bitrate:    handshake.Bitrate,
+			SampleRate: handshake.SampleRate,
+		})
+		if err != nil {
+			close_reason = fmt.Sprintf("apply capture config failed: %v", err)
+			client_logger.Warnw("cannot apply capture config", "error", err)
+			return
+		}
 		if err := this.acquireClient(); err != nil {
 			close_reason = fmt.Sprintf("start recording failed: %v", err)
 			client_logger.Warnw("cannot start recording", "error", err)
@@ -572,18 +927,27 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 		}
 		client_acquired = true
 
-		err := this.ws_send_pocket(client_ctx, &pocket.Handshake{
+		err = this.ws_send_pocket(client_ctx, &pocket.Handshake{
 			Type:         pocket.POCKET_S_R_HANDSHAKE,
 			Ctx:          client_ctx,
 			Compression:  client_ctx.Compressor.Ident(),
 			TargetBuffer: client_ctx.TargetBuffer,
+			Device:       capture.Device,
+			Bitrate:      capture.Bitrate,
+			SampleRate:   capture.SampleRate,
 		})
 		if err != nil {
 			close_reason = "handshake response send failed"
 			client_logger.Warnw("cannot send handshake (response) pocket", "error", err)
 			return
 		} else {
-			client_ctx.Logger.Infow("client handshake", "compression", client_ctx.Compressor.Ident(), "target-buffer", client_ctx.TargetBuffer)
+			client_ctx.Logger.Infow("client handshake",
+				"compression", client_ctx.Compressor.Ident(),
+				"target-buffer", client_ctx.TargetBuffer,
+				"device", capture.Device,
+				"bitrate", capture.Bitrate,
+				"sample-rate", capture.SampleRate,
+			)
 		}
 	} else {
 		close_reason = "invalid handshake pocket"
@@ -699,6 +1063,15 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 						client_logger.Warnw("cannot update client compressor", "error", err)
 						continue
 					}
+					capture, err := this.reconfigureCapture(captureConfig{
+						Device:     typed_pkt.Device,
+						Bitrate:    typed_pkt.Bitrate,
+						SampleRate: typed_pkt.SampleRate,
+					})
+					if err != nil {
+						client_logger.Warnw("cannot apply capture config", "error", err)
+						continue
+					}
 					client_ctx.Compressor = new_compressor
 					client_ctx.CurrentBuffer = 0
 					client_ctx.CurrentSeq = 0
@@ -716,13 +1089,22 @@ func (this *Service) HandleWebsocket(c *gin.Context) {
 						Ctx:          client_ctx,
 						Compression:  client_ctx.Compressor.Ident(),
 						TargetBuffer: client_ctx.TargetBuffer,
+						Device:       capture.Device,
+						Bitrate:      capture.Bitrate,
+						SampleRate:   capture.SampleRate,
 					})
 					if err != nil {
 						client_logger.Warnw("cannot send re-config handshake response", "error", err)
 						close_reason = fmt.Sprintf("re-config handshake response failed: %v", err)
 						return
 					}
-					client_logger.Infow("client re-config handshake", "compression", client_ctx.Compressor.Ident(), "target-buffer", client_ctx.TargetBuffer)
+					client_logger.Infow("client re-config handshake",
+						"compression", client_ctx.Compressor.Ident(),
+						"target-buffer", client_ctx.TargetBuffer,
+						"device", capture.Device,
+						"bitrate", capture.Bitrate,
+						"sample-rate", capture.SampleRate,
+					)
 					last_buffer_update = time.Now()
 				case *pocket.Close:
 					this.logger.Infof("received close pocket (source: %s): %s", typed_pkt.Source, typed_pkt.Reason)
@@ -908,11 +1290,28 @@ func NewServiceWithAudioThreshold(logger *zap.SugaredLogger, buffer_rate uint, a
 }
 
 func NewServiceWithIdleThreshold(logger *zap.SugaredLogger, buffer_rate uint, audio_threshold uint, idle_threshold time.Duration) (*Service, error) {
+	return NewServiceWithOptions(logger, ServiceOptions{
+		BufferRate:     buffer_rate,
+		AudioThreshold: audio_threshold,
+		IdleThreshold:  idle_threshold,
+	})
+}
+
+type ServiceOptions struct {
+	BufferRate     uint
+	AudioThreshold uint
+	IdleThreshold  time.Duration
+	AllowMic       bool
+}
+
+func NewServiceWithOptions(logger *zap.SugaredLogger, options ServiceOptions) (*Service, error) {
 	service := &Service{
 		logger:          logger,
-		buffer_rate:     buffer_rate,
-		audio_threshold: audio_threshold,
-		idle_threshold:  idle_threshold,
+		buffer_rate:     options.BufferRate,
+		audio_threshold: options.AudioThreshold,
+		idle_threshold:  options.IdleThreshold,
+		allow_mic:       options.AllowMic,
+		capture:         defaultCapture(),
 		latency:         ServiceLatency{},
 	}
 

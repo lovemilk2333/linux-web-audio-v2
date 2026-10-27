@@ -57,6 +57,12 @@ type Handshake struct {
 	Compression string `bson:"c"`
 	// rate of `FRAME_DURATION`: 1 -> 10ms, 2 -> 20ms
 	TargetBuffer uint16 `bson:"tb"`
+	// Pulse sink name; empty selects the default output
+	Device string `bson:"dev,omitempty"`
+	// Opus bitrate in bit/s; 0 keeps the server default
+	Bitrate uint `bson:"br,omitempty"`
+	// capture sample rate in Hz; 0 keeps the server default
+	SampleRate uint `bson:"sr,omitempty"`
 }
 
 func (this *Handshake) GetCompressor() (ctx.Compressor, error) {
